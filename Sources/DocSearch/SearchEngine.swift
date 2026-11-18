@@ -19,6 +19,15 @@ struct Candidate {
     var bm25Score: Double? = nil
 }
 
+/// 决策判定路径的 BM25 召回候选，携带原文切片。
+struct BM25Slice {
+    let docID: String
+    let title: String
+    let content: String
+    let bm25Score: Double
+    let bm25Rank: Int
+}
+
 /// 建库 / 入库 / 检索。三张要求的表 + 一个 FTS5 BM25 索引（不是数据表）。
 final class SearchEngine {
     let db: SQLiteDB
@@ -202,6 +211,48 @@ final class SearchEngine {
         timing?("tokens", Double(tokenTotal))
         timing?("chunks", Double(added))
         return chunks.count
+    }
+
+    /// 决策判定路径专用：直接从原文切片表关联的 FTS5 索引做 BM25 检索，
+    /// 返回带原文切片的候选（不经过 ColBERT 向量粗排 / MaxSim 精排）。
+    /// AND 命中不足时回退 OR，与混合检索的召回策略保持一致。
+    static func bm25Slices(db: SQLiteDB, query: String, limit: Int = 50,
+                           timing externalTiming: ((String, Double) -> Void)? = nil) throws -> [BM25Slice] {
+        let started = Date()
+        guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
+        AppLog.shared.log("[决策检索] 进入 BM25 召回：\(query)")
+
+        func recall(_ mode: String) throws -> [[String: SQLValue]] {
+            let match = TextAnalysis.ftsQuery(query, mode: mode)
+            guard !match.isEmpty else { return [] }
+            return try db.query("""
+                SELECT f.doc_id AS doc_id, bm25(document_fts) AS score,
+                       d.title AS title, d.content AS content
+                FROM document_fts AS f
+                JOIN document AS d ON d.doc_id = f.doc_id
+                WHERE document_fts MATCH ? ORDER BY score LIMIT ?
+                """, [.text(match), .int(Int64(max(1, limit)))])
+        }
+
+        var rows = try recall("AND")
+        if rows.count < min(5, limit) {
+            let orRows = try recall("OR")
+            if orRows.count > rows.count { rows = orRows }
+        }
+        var slices: [BM25Slice] = []
+        for (index, row) in rows.enumerated() {
+            guard let id = row["doc_id"]?.stringValue,
+                  let content = row["content"]?.stringValue else { continue }
+            slices.append(BM25Slice(docID: id,
+                                    title: row["title"]?.stringValue ?? "",
+                                    content: content,
+                                    bm25Score: row["score"]?.doubleValue ?? 0,
+                                    bm25Rank: index + 1))
+        }
+        let elapsed = Date().timeIntervalSince(started)
+        externalTiming?("decision_bm25", elapsed)
+        AppLog.shared.log(String(format: "[决策检索] BM25 召回完成 %.3fs（候选 %d）", elapsed, slices.count))
+        return slices
     }
 
     // MARK: - 检索

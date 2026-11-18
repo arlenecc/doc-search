@@ -5,7 +5,7 @@ enum DocSearchCLI {
     static let defaultModel = "/Volumes/SSD/embedding&reranker/jina-colbert-v2-64-onnx-int8"
 
     static let commands: Set<String> = [
-        "init", "add", "sync", "search", "self-test", "db-stats", "ann-status",
+        "init", "add", "sync", "search", "decision-search", "decision-verify", "self-test", "db-stats", "ann-status",
         "ann-build", "ann-drop", "ann-bench", "ocr-test", "chunk-test", "models",
         "-h", "--help", "help",
     ]
@@ -81,6 +81,93 @@ enum DocSearchCLI {
                 let preview = hit.content.prefix(options["full"] != nil ? hit.content.count : 220)
                 print("    \(preview)")
             }
+        case "decision-search":
+            guard let query = options["query"] else {
+                throw DocSearchError.argument("decision-search 需要 --query TEXT")
+            }
+            let db = try SQLiteDB(path: dbPath)
+            try SearchEngine.createSchema(db)
+            let recall = Int(options["recall"] ?? "") ?? config.decisionRecallCount
+            let topN = Int(options["top"] ?? "5") ?? 5
+            let slices = try SearchEngine.bm25Slices(db: db, query: query, limit: recall)
+            print("BM25 召回 \(slices.count) 个原文切片，开始决策判定…")
+            let decisionPath = value(options, "model", config.decisionModelPath)
+            let batchSize = Int(options["batch"] ?? "") ?? config.decisionBatchSize
+            let loadStart = Date()
+            let judge = try await DecisionJudge.load(
+                modelPath: decisionPath,
+                batchSize: batchSize,
+                chunkChars: Int(options["chunk-chars"] ?? "") ?? config.decisionChunkChars)
+            let loadElapsed = Date().timeIntervalSince(loadStart)
+            let judgeStart = Date()
+            let verdicts = try await judge.judge(query: query, slices: slices, topN: topN) { done, total in
+                print(String(format: "  判定进度 \(done)/\(total) · 已耗时 %.2fs", Date().timeIntervalSince(judgeStart)))
+            }
+            let judgeElapsed = Date().timeIntervalSince(judgeStart)
+            let batches = (slices.count + batchSize - 1) / batchSize
+            print("问句: \(query)  (BM25 \(slices.count) → 判定 \(verdicts.count) 条)")
+            print(String(format: "[决策计时] 模型加载 %.3fs · 判定 %.3fs（\(batches) 批 × batch=\(batchSize)）· 合计 %.3fs",
+                         loadElapsed, judgeElapsed, loadElapsed + judgeElapsed))
+            for (i, verdict) in verdicts.enumerated() {
+                let slice = verdict.slice
+                print("\n[\(i + 1)] P(相关)=\(String(format: "%.4f", verdict.probability))  bm25#\(slice.bm25Rank)  score=\(String(format: "%.3f", slice.bm25Score))")
+                print("    doc_id=\(slice.docID)  title=\(slice.title)")
+                let preview = slice.content.prefix(options["full"] != nil ? slice.content.count : 220)
+                print("    \(preview)")
+            }
+        case "decision-verify":
+            // 读取 Python 参考实现保存的 token ids / marker / 概率，对比 Swift backbone 输出。
+            guard let probePath = options["probe"] else {
+                throw DocSearchError.argument("decision-verify 需要 --probe PATH（Python 参考 JSON）")
+            }
+            guard let data = FileManager.default.contents(atPath: probePath),
+                  let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let ids = json["ids"] as? [Int],
+                  let markers = json["markers"] as? [Int],
+                  let expected = json["probs"] as? [Double] else {
+                throw DocSearchError.argument("无法解析 probe JSON")
+            }
+            let decisionPath = value(options, "model", config.decisionModelPath)
+            let judge = try await DecisionJudge.load(modelPath: decisionPath,
+                                                     batchSize: Int(options["batch"] ?? "") ?? config.decisionBatchSize,
+                                                     chunkChars: Int(options["chunk-chars"] ?? "") ?? config.decisionChunkChars)
+            // 先核对 tokenizer：Swift 对同一渲染文本的编码是否与 Python 一致。
+            if let rendered = json["rendered"] as? String {
+                let swiftIDs = judge.tokenizeRendered(rendered)
+                let tokenMatch = swiftIDs == ids
+                print("Tokenizer 一致性：Swift \(swiftIDs.count) tokens vs Python \(ids.count) tokens \(tokenMatch ? "✓ 完全一致" : "✗ 不一致")")
+                if !tokenMatch {
+                    let prefix = zip(swiftIDs, ids).first(where: { $0.0 != $0.1 })
+                    print("  首个差异：swift=\(prefix?.0 ?? -1) python=\(prefix?.1 ?? -1)")
+                }
+            }
+            // 核对完整构造路径（模板 + chat template）：与探针同样的 query/chunks 是否产生同样 ids。
+            let probeChunks = [
+                "Order 1182: customer returns blender bought 45 days ago.",
+                "What is the capital of France?",
+                "The transformer uses self-attention mechanisms.",
+                "Refund requests must be submitted within 30 days of purchase.",
+            ]
+            let built = try judge.probeIDs(query: "returns policy within 30 days", chunkTexts: probeChunks)
+            let buildMatch = built == ids
+            print("模板构造一致性：Swift \(built.count) tokens vs Python \(ids.count) tokens \(buildMatch ? "✓ 完全一致" : "✗ 不一致")")
+            if !buildMatch {
+                var firstDiff = -1
+                for i in 0..<min(built.count, ids.count) where built[i] != ids[i] {
+                    firstDiff = i
+                    break
+                }
+                print("  首个差异 index=\(firstDiff) swift=\(firstDiff >= 0 ? built[firstDiff] : -1) python=\(firstDiff >= 0 ? ids[firstDiff] : -1)")
+            }
+            let actual = try await judge.judgeTokenIDs(ids, markers: markers)
+            print("Swift vs Python 参考 P(true)（token 数 \(ids.count)，marker \(markers)）：")
+            var maxDiff = 0.0
+            for (i, (a, e)) in zip(actual, expected).enumerated() {
+                let diff = abs(Double(a) - e)
+                maxDiff = max(maxDiff, diff)
+                print(String(format: "  #%d swift=%.4f python=%.4f diff=%.4f", i + 1, a, e, diff))
+            }
+            print(String(format: "最大差值 %.4f（<0.02 视为对齐）", maxDiff))
         case "sync":
             var cfg = ToolConfig.load()
             if let value = options["source"] { cfg.sourceDirectory = value }
@@ -590,9 +677,9 @@ enum DocSearchCLI {
         // 短章节（表格/代码块）按设计不再跨章节拼长，允许保留为独立短片；
         // 但任何切片都不能超过 maxChars，长章节必须产出至少一片 7500+ 的切片。
         guard !chunks.isEmpty,
-              chunks.allSatisfy({ $0.content.count <= 8000 }),
-              chunks.contains(where: { $0.content.count >= 7500 }),
-              chunks.allSatisfy({ $0.content.count >= 7500
+              chunks.allSatisfy({ $0.content.count <= 3000 }),
+              chunks.contains(where: { $0.content.count >= 2500 }),
+              chunks.allSatisfy({ $0.content.count >= 2500
                 || $0.content.contains("| 方法 |") || $0.content.contains("```") }) else {
             throw DocSearchError.chunking("切片长度异常: \(chunks.map(\.content.count))")
         }
@@ -662,6 +749,8 @@ enum DocSearchCLI {
       swift run -c release DocSearch init  --db PATH
       swift run -c release DocSearch add   --db PATH --file 文本_path [--title 标题] [--bits 4] [--model DIR] [--timing]
       swift run -c release DocSearch search --db PATH --query "问句" [--top 5] [--coarse 20] [--nprobe 32] [--rescore 64] [--min-score-ratio 0.9] [--exact] [--force-ann]
+      swift run -c release DocSearch decision-search --db PATH --query "问句" [--top 5] [--recall 50] [--batch 8] [--chunk-chars 160] [--model DIR] [--full]
+        # 决策判定路径：BM25 从原文切片表召回 → karpo 决策模型逐片判定相关性 → 取分数最高 topN
       swift run -c release DocSearch db-stats --db PATH
       swift run -c release DocSearch ann-status --db PATH
       swift run -c release DocSearch ann-build  --db PATH [--clusters 512] [--cluster-size 512] [--iterations 8] [--force]

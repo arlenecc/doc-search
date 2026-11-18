@@ -3,14 +3,16 @@ import Foundation
 struct ChunkRecord {
     let title: String
     var content: String
-    /// 所属章节序号：同名但不同位置的章节（如多个“小结”）不能被合并到一起。
+    /// 所属章节（目录上级）ID：同一章内的小节可以整段合并。
     let sectionID: Int
+    /// 所属小节 ID：跨小节的句子搬运/重叠都被禁止，尽量不切开小节。
+    let partID: Int
 }
 
 struct ChunkOptions {
-    var minChars = 7500
-    var maxChars = 8000
-    var targetChars = 7750
+    var minChars = 2500
+    var maxChars = 3000
+    var targetChars = 2750
     var overlapRatio = 0.015
     var semanticThreshold = 0.55
     var similarityFloor = 0.15
@@ -23,20 +25,27 @@ struct ChunkOptions {
 enum Chunker {
     private enum AtomKind { case prose, table, code, heading }
     private struct Atom { let text: String; let kind: AtomKind }
-    private struct Section { let title: String; let atoms: [Atom] }
+    private struct Section {
+        let id: Int
+        let parentID: Int
+        let level: Int
+        let title: String
+        let atoms: [Atom]
+    }
 
     static func split(_ text: String, sourceName: String, model: ColBERT?,
                       options: ChunkOptions = ChunkOptions()) throws -> [ChunkRecord] {
         let sections = parseSections(text, sourceName: sourceName)
         var chunks: [ChunkRecord] = []
-        for (sectionIndex, section) in sections.enumerated() {
+        for section in sections {
             let pieces = try split(section, model: model, options: options)
             let heading = section.title.trimmingCharacters(in: .whitespacesAndNewlines)
             for piece in pieces {
                 // 同一章节后续切片未必带原标题，补上标题让检索与阅读都有章节上下文。
                 let content = (!heading.isEmpty && !piece.hasPrefix("#"))
                     ? "# \(heading)\n" + piece : piece
-                chunks.append(ChunkRecord(title: section.title, content: content, sectionID: sectionIndex))
+                chunks.append(ChunkRecord(title: section.title, content: content,
+                                          sectionID: section.parentID, partID: section.id))
             }
         }
         return coalesce(chunks, options: options)
@@ -57,6 +66,20 @@ enum Chunker {
             line.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil
         }) else { return false }
         return isPlausibleHeading(trimmed)
+    }
+
+    /// 标题层级：Markdown # 数量优先，中文“第 N 章/篇”与 Chapter/Part 视为一级目录。
+    private static func headingLevel(_ line: String) -> Int {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        let hashes = trimmed.prefix(while: { $0 == "#" }).count
+        if hashes > 0 { return min(6, hashes) }
+        let lower = trimmed.lowercased()
+        if lower.hasPrefix("chapter") || lower.hasPrefix("part")
+            || trimmed.range(of: "^第[一二三四五六七八九十百千零〇0-9]+[章节篇部卷]",
+                             options: .regularExpression) != nil {
+            return 1
+        }
+        return 2
     }
 
     /// OCR 常把页眉、参考文献残片、URL 写成 `##` 标题；这类行不能当章节边界。
@@ -89,6 +112,10 @@ enum Chunker {
         var codeLines: [String] = []
         var fence = ""
         var tableLines: [String] = []
+        var currentID = 0
+        var currentParentID = 0
+        var currentLevel = 0
+        var nextID = 1
 
         func flushParagraph() {
             guard !paragraph.isEmpty else { return }
@@ -110,7 +137,10 @@ enum Chunker {
         }
         func flushSection() {
             flushParagraph(); flushTable()
-            if !atoms.isEmpty { sections.append(Section(title: title, atoms: atoms)) }
+            if !atoms.isEmpty {
+                sections.append(Section(id: currentID, parentID: currentParentID,
+                                        level: currentLevel, title: title, atoms: atoms))
+            }
             atoms.removeAll(keepingCapacity: true)
         }
 
@@ -139,6 +169,11 @@ enum Chunker {
             flushTable()
             if isHeading(trimmed) {
                 flushSection()
+                let level = Self.headingLevel(trimmed)
+                currentID = nextID; nextID += 1
+                currentLevel = level
+                // 一级目录开启新章；小节沿用当前章 ID，便于同章内整段合并。
+                currentParentID = level <= 1 ? currentID : currentParentID
                 title = trimmed.replacingOccurrences(of: "^\\s*#+\\s*", with: "", options: .regularExpression)
                 atoms.append(Atom(text: line + "\n", kind: .heading))
             } else if trimmed.isEmpty {
@@ -149,7 +184,9 @@ enum Chunker {
         }
         if inCode { atoms.append(Atom(text: codeLines.joined(separator: "\n"), kind: .code)) }
         flushSection()
-        return sections.isEmpty ? [Section(title: sourceName, atoms: [])] : sections
+        return sections.isEmpty
+            ? [Section(id: 0, parentID: 0, level: 0, title: sourceName, atoms: [])]
+            : sections
     }
 
     // MARK: - 章节内切分
@@ -346,7 +383,8 @@ enum Chunker {
         guard chars > 0, chunks.count > 1 else { return chunks }
         var out = chunks
         for i in stride(from: out.count - 1, through: 1, by: -1) {
-            guard out[i].sectionID == out[i - 1].sectionID else { continue }
+            guard out[i].sectionID == out[i - 1].sectionID,
+                  out[i].partID == out[i - 1].partID else { continue }
             var prefix = String(out[i - 1].content.suffix(chars))
             // 上一片末尾恰好是标题行时不要重复注入标题。
             while prefix.hasPrefix("#"), let newline = prefix.firstIndex(of: "\n") {
@@ -379,11 +417,11 @@ enum Chunker {
                 if last.content.count + chunk.content.count + 1 <= options.maxChars {
                     out[out.count - 1] = ChunkRecord(title: last.title,
                                                     content: last.content + "\n" + chunk.content,
-                                                    sectionID: last.sectionID)
+                                                    sectionID: last.sectionID, partID: last.partID)
                     continue
                 }
-                // 合成会超上限：从上一片尾部按句界搬句子给短片，两片都回到目标区间。
-                if let split = rebalance(last, chunk, options: options) {
+                // 合成会超上限：只在同小节拆出的片之间搬句子，不切开另一个小节。
+                if last.partID == chunk.partID, let split = rebalance(last, chunk, options: options) {
                     out.removeLast()
                     out.append(contentsOf: split)
                     continue
@@ -400,7 +438,9 @@ enum Chunker {
     /// 首片偏短时从下一片头部递归搬句子（先保证下一片自身达标）。
     private static func ensureMinForward(_ index: Int, in chunks: inout [ChunkRecord],
                                          options: ChunkOptions) {
-        guard index + 1 < chunks.count, chunks[index].content.count < options.minChars else { return }
+        guard index + 1 < chunks.count,
+              chunks[index].partID == chunks[index + 1].partID,
+              chunks[index].content.count < options.minChars else { return }
         ensureMinForward(index + 1, in: &chunks, options: options)
         while chunks[index].content.count < options.minChars {
             let nextSentences = TextAnalysis.sentences(chunks[index + 1].content)
@@ -415,7 +455,9 @@ enum Chunker {
 
     /// 从尾到头递归补齐短片：先补上一片，再从上一片句尾搬句子过来。
     private static func ensureMin(_ index: Int, in chunks: inout [ChunkRecord], options: ChunkOptions) {
-        guard index > 0, chunks[index].content.count < options.minChars else { return }
+        guard index > 0,
+              chunks[index].partID == chunks[index - 1].partID,
+              chunks[index].content.count < options.minChars else { return }
         ensureMin(index - 1, in: &chunks, options: options)
         while chunks[index].content.count < options.minChars {
             let donorSentences = TextAnalysis.sentences(chunks[index - 1].content)
@@ -445,7 +487,9 @@ enum Chunker {
         guard !moved.isEmpty, firstText.count >= options.minChars * 4 / 5,
               nextText.count >= options.minChars * 9 / 10,
               firstText.count <= options.maxChars, nextText.count <= options.maxChars else { return nil }
-        return [ChunkRecord(title: first.title, content: firstText, sectionID: first.sectionID),
-                ChunkRecord(title: second.title, content: nextText, sectionID: second.sectionID)]
+        return [ChunkRecord(title: first.title, content: firstText,
+                            sectionID: first.sectionID, partID: first.partID),
+                ChunkRecord(title: second.title, content: nextText,
+                            sectionID: second.sectionID, partID: second.partID)]
     }
 }

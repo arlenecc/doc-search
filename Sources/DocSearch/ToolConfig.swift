@@ -6,6 +6,16 @@ struct ToolConfig {
     /// 唯一的工作目录：Markdown 输出为 <工作目录>/markdown，数据库为 <工作目录>/db/doc_search.db。
     var workDirectory = ""
     var modelDirectory = "/Volumes/SSD/embedding&reranker/jina-colbert-v2-64-onnx-int8"
+    /// 决策判定模型目录（karpo-decision-4B-mlx-int4，含 readout.safetensors）。
+    var decisionModelPath = "/Volumes/SSD/Decision Model/karpo-decision-4B-mlx-int4"
+    /// 检索路径：vector=向量检索（默认），decision=BM25 召回 + 决策模型判定。
+    var searchMode = "vector"
+    /// 决策模式 BM25 召回切片数。
+    var decisionRecallCount = 50
+    /// 决策模式单次前向的切片数（越大越快，但占内存）。
+    var decisionBatchSize = 8
+    /// 决策模式每片送入判定的最大正文字数。
+    var decisionChunkChars = 160
 
     var expandedWorkDirectory: String {
         let raw = workDirectory.isEmpty ? Self.defaultWorkDirectory() : workDirectory
@@ -45,8 +55,8 @@ struct ToolConfig {
     var ovisInstances = 2
 
     // 切片 / 词向量 / 残差
-    var chunkMinChars = 7500
-    var chunkMaxChars = 8000
+    var chunkMinChars = 2500
+    var chunkMaxChars = 3000
     var chunkOverlapRatio = 0.015
     var semanticThreshold = 0.55
     var semanticFloor = 0.15
@@ -118,6 +128,11 @@ struct ToolConfig {
                         }
                     }
                 case "modelDirectory": result.modelDirectory = value as? String ?? result.modelDirectory
+                case "decisionModelPath": result.decisionModelPath = value as? String ?? result.decisionModelPath
+                case "searchMode": result.searchMode = value as? String ?? result.searchMode
+                case "decisionRecallCount": result.decisionRecallCount = value as? Int ?? result.decisionRecallCount
+                case "decisionBatchSize": result.decisionBatchSize = value as? Int ?? result.decisionBatchSize
+                case "decisionChunkChars": result.decisionChunkChars = value as? Int ?? result.decisionChunkChars
                 case "syncConcurrency": result.syncConcurrency = value as? Int ?? result.syncConcurrency
                 case "incrementalConversion": result.incrementalConversion = value as? Bool ?? result.incrementalConversion
                 case "parseRenderDPI": result.parseRenderDPI = value as? Double ?? result.parseRenderDPI
@@ -170,8 +185,10 @@ struct ToolConfig {
         try? fm.createDirectory(atPath: (result.databasePath as NSString).deletingLastPathComponent,
                                 withIntermediateDirectories: true)
         if result.modelDirectory.isEmpty { result.modelDirectory = defaultPaths().modelDirectory }
-        // 旧配置里的 1% 是历史默认值，按本次调整迁移到 1.5%。
+        // 旧配置里的历史默认值迁移到新的切片尺寸。
         if result.chunkOverlapRatio == 0.01 { result.chunkOverlapRatio = 0.015; changed = true }
+        if result.chunkMinChars == 7500 { result.chunkMinChars = 2500; changed = true }
+        if result.chunkMaxChars == 8000 { result.chunkMaxChars = 3000; changed = true }
         // 模型目录可能被移动到常见落点；配置的旧路径失效时自动纠正，避免检索直接报错。
         if !fm.fileExists(atPath: result.modelDirectory + "/tokenizer.json") {
             let name = (result.modelDirectory as NSString).lastPathComponent
@@ -204,6 +221,11 @@ struct ToolConfig {
             "sourceDirectory": copy.sourceDirectory,
             "workDirectory": copy.workDirectory,
             "modelDirectory": copy.modelDirectory,
+            "decisionModelPath": copy.decisionModelPath,
+            "searchMode": copy.searchMode,
+            "decisionRecallCount": copy.decisionRecallCount,
+            "decisionBatchSize": copy.decisionBatchSize,
+            "decisionChunkChars": copy.decisionChunkChars,
             "syncConcurrency": copy.syncConcurrency,
             "incrementalConversion": copy.incrementalConversion,
             "parseRenderDPI": copy.parseRenderDPI,

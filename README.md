@@ -7,9 +7,10 @@ macOS 上的本地文档检索与阅读工具：把 PDF / EPUB / Office / 纯文
 ## 功能特性
 
 - **多格式解析**：PDF（Apple Vision / OvisOCR3 / 混合）、EPUB、Office、纯文本；支持增量转换与取消。
-- **语义切片**：按标题分节，结合 potion multilingual 句向量判断语义断点；默认切片 7500–8000 字、1.5% 重叠，表格与代码块保持完整。
+- **语义切片**：优先按章节目录层级分节，小节尽量保持完整；结合 potion multilingual 句向量判断语义断点；默认切片 2500–3000 字、1.5% 重叠，表格与代码块保持完整。
 - **ColBERT 编码**：查询与文档分别使用 `[QueryMarker]`(250002) / `[DocumentMarker]`(250003)；查询侧按 ColBERT 约定补 `<mask>` 增强；文档侧做词项剪枝后逐词编码并 L2 归一化。
-- **混合召回**：vec0 精确检索（或大库自动切换 ANN 粗筛）+ FTS5 BM25，RRF 融合后取 shortlist，再用 4bit 残差向量做 MaxSim 精排，最后按最低分比例过滤凑数结果。
+- **双检索路径**：主窗口左上角“工作区”提供二选一开关——**向量检索**（默认：ColBERT + BM25 混合召回 + 4bit 残差 MaxSim 精排）与**决策判定**（BM25 从原文切片表召回前 50 条 → 决策模型逐片判定相关性 → 取分数最高的 5 条）。
+- **决策判定**：使用 `karpo-decision-4B-mlx-int4`，在 joint-preview 模板下为每个切片放一个 readout marker，读取 backbone final-norm hidden state 经 fp32 readout 头算出 P(相关)；一次前向批量判定多个切片。可配置召回数（默认 50）、批大小（默认 8）与每片字数（默认 160）。
 - **检索阅读模式**：结果以气泡展示，点击打开阅读面板，前后翻片并显示查询词高亮。
 - **实时日志窗口**：右上角“日志”按钮或 `⌘⇧L` 打开独立窗口，实时查看检索阶段耗时、同步进度与错误。
 - **CLI 与 GUI 共用一套内核**：可命令行批处理，也可 `swift run DocSearch` 启动图形界面。
@@ -55,9 +56,16 @@ swift run -c release DocSearch sync --source /path/to/docs [--workdir /path/to/w
 swift run -c release DocSearch init --db /path/to/doc_search.db
 swift run -c release DocSearch add --db /path/to/doc_search.db --file /path/a.md [--title "标题"]
 
-# 检索
+# 检索（向量检索：ColBERT + BM25 混合）
 swift run -c release DocSearch search --db /path/to/doc_search.db \
   --query "街道名称如何改变城市记忆" --top 5 --coarse 20
+
+# 决策判定检索（BM25 召回 50 片 → 决策模型判定 → Top5）
+swift run -c release DocSearch decision-search --db /path/to/doc_search.db \
+  --query "街道名称如何改变城市记忆" --top 5 --recall 50 --batch 8 --chunk-chars 160
+
+# 决策模型自检（对比 Python 参考实现的数值一致性）
+swift run -c release DocSearch decision-verify --probe /path/to/probe.json
 
 # 索引维护与诊断
 swift run -c release DocSearch db-stats --db PATH
@@ -80,7 +88,10 @@ GUI 设置写入 `~/Library/Application Support/DocSearch/config.json`，CLI 也
 | `sourceDirectory` | 空 | 待同步文档目录 |
 | `workDirectory` | `~/Library/Application Support/DocSearch` | 唯一工作目录；Markdown 输出到 `<工作目录>/markdown`，数据库为 `<工作目录>/db/doc_search.db` |
 | `modelDirectory` | jina-colbert-v2-64-onnx-int8 所在目录 | ColBERT ONNX 模型，可用 `--model` 或 `DOCSEARCH_MODEL` 覆盖 |
-| `chunkMinChars` / `chunkMaxChars` | 7500 / 8000 | 切片字数区间 |
+| `searchMode` | `vector` | 检索路径：`vector` 向量检索 / `decision` 决策判定（GUI 左上角开关可切换） |
+| `decisionModelPath` | karpo-decision-4B-mlx-int4 所在目录 | 决策判定模型，目录需含 `readout.safetensors` |
+| `decisionRecallCount` / `decisionBatchSize` / `decisionChunkChars` | 50 / 8 / 160 | 决策模式 BM25 召回数 / 单批判定数 / 每片最大字数 |
+| `chunkMinChars` / `chunkMaxChars` | 2500 / 3000 | 切片字数区间；优先按目录层级切，小节尽量保持完整 |
 | `chunkOverlapRatio` | 0.015 | 相邻切片重叠比例 |
 | `quantBits` | 4 | 残差量化位数 |
 | `resultTopN` / `coarseCount` | 5 / 20 | 返回数与粗筛数 |
@@ -93,6 +104,7 @@ GUI 设置写入 `~/Library/Application Support/DocSearch/config.json`，CLI 也
 
 - **ColBERT**：`jina-colbert-v2-64-onnx-int8`（64 维），目录需含 `model_int8.onnx`、`tokenizer.json`、`config.json`。
 - **语义切片**：`potion-multilingual-128M`（int4 ONNX），可在配置中指定目录或自动查找。
+- **决策判定（可选）**：`karpo-decision-4B-mlx-int4`（Qwen3.5-4B backbone + fp32 readout 头），仅在“决策判定”检索路径用到；输出每个切片的相关概率，非生成式用途。
 - **OCR（可选）**：OvisOCR3（MLX/GGUF/ONNX）用于扫描 PDF 与图片；默认 PDF 引擎为 Apple Vision。
 - 停用词表位于 `Sources/DocSearch/Resources/stopwords_full.txt`。
 

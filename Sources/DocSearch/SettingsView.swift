@@ -61,7 +61,7 @@ struct SettingsView: View {
                     }
                     DisclosureGroup("切片 / 词向量 / 残差") {
                         Stepper("最小字数 \(draft.chunkMinChars)", value: $draft.chunkMinChars,
-                                in: 2000...7900, step: 100)
+                                in: 2500...2900, step: 100)
                         Stepper("最大字数 \(draft.chunkMaxChars)", value: $draft.chunkMaxChars,
                                 in: 3000...12000, step: 100)
                         Slider(value: $draft.chunkOverlapRatio, in: 0...0.05, step: 0.005)
@@ -79,6 +79,21 @@ struct SettingsView: View {
                             Text("2 bit（更省空间）").tag(2)
                         }
                         .pickerStyle(.segmented)
+                    }
+                    DisclosureGroup("决策判定") {
+                        Picker("检索方式", selection: $draft.searchMode) {
+                            Text("向量检索（默认）").tag("vector")
+                            Text("决策判定（BM25 + 决策模型）").tag("decision")
+                        }
+                        pathField("决策模型目录", text: $draft.decisionModelPath, chooseDirectory: true)
+                        Stepper("BM25 召回切片数 \(draft.decisionRecallCount)",
+                                value: $draft.decisionRecallCount, in: 10...1000, step: 10)
+                        Stepper("判定批大小 \(draft.decisionBatchSize)",
+                                value: $draft.decisionBatchSize, in: 1...32, step: 1)
+                        Stepper("每片最大字数 \(draft.decisionChunkChars)",
+                                value: $draft.decisionChunkChars, in: 80...1200, step: 40)
+                        Text("决策模型为 karpo-decision-4B-mlx-int4（需含 readout.safetensors）。批大小越大越快但占用更多内存；每片字数越大越准确但更慢。")
+                            .font(.caption2).foregroundStyle(.secondary)
                     }
                     DisclosureGroup("检索 / 阅读") {
                         Stepper("返回分片数 \(draft.resultTopN)", value: $draft.resultTopN, in: 1...50)
@@ -106,7 +121,7 @@ struct SettingsView: View {
                 Button("取消") { dismiss() }
                 Button("保存并应用") {
                     if draft.chunkMinChars > draft.chunkMaxChars {
-                        draft.chunkMinChars = draft.chunkMaxChars - 100
+                        draft.chunkMinChars = max(2500, draft.chunkMaxChars - 100)
                     }
                     apply(draft)
                     dismiss()

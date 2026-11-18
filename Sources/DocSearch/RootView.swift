@@ -16,6 +16,15 @@ struct RootView: View {
                 Section("工作区") {
                     Label("检索对话", systemImage: "bubble.left.and.bubble.right")
                         .foregroundColor(.accentColor)
+                    Picker("检索方式", selection: Binding(
+                        get: { model.searchMode },
+                        set: { model.setSearchMode($0) }
+                    )) {
+                        Text("向量检索").tag("vector")
+                        Text("决策判定").tag("decision")
+                    }
+                    .pickerStyle(.segmented)
+                    .help("向量检索：ColBERT 向量召回；决策判定：BM25 召回 + 决策模型判定")
                 }
                 Section("知识库") {
                     Text(model.config.sourceDirectory.isEmpty
@@ -93,7 +102,7 @@ struct RootView: View {
         .sheet(item: $model.reader) { state in
             ChunkReaderView(state: state)
                 .environmentObject(model)
-                .frame(minWidth: 760, minHeight: 560)
+                .frame(minWidth: 380, idealWidth: 420, minHeight: 560)
         }
         .onReceive(NotificationCenter.default.publisher(for: .docSearchOpenSettings)) { _ in
             showSettings = true

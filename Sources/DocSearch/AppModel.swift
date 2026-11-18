@@ -25,6 +25,7 @@ final class AppModel: ObservableObject {
                        text: "直接输入问题即可检索知识库；检索结果会以分片气泡显示，点击可打开阅读。")
     ]
     @Published var input = ""
+    @Published var searchMode = ToolConfig.load().searchMode == "decision" ? "decision" : "vector"
     @Published var isSyncing = false
     @Published var isSearching = false
     @Published var syncStatus = "尚未同步"
@@ -40,6 +41,7 @@ final class AppModel: ObservableObject {
     @Published var downloadStatus = ""
 
     private var engine: SearchEngine?
+    private var decisionJudge: DecisionJudge?
     private let syncService = KnowledgeSyncService()
     private let modelDownloader = DocSearchModelDownloader()
 
@@ -95,8 +97,19 @@ final class AppModel: ObservableObject {
         config = newConfig
         config.save()
         engine = nil
+        decisionJudge = nil
+        searchMode = newConfig.searchMode == "decision" ? "decision" : "vector"
         checkModels()
         status = "配置已保存；检索前将重新加载模型/数据库"
+    }
+
+    func setSearchMode(_ mode: String) {
+        searchMode = mode
+        config.searchMode = mode
+        config.save()
+        status = mode == "decision"
+            ? "决策判定：BM25 召回 + 决策模型判定（首次会加载 4B 模型）"
+            : "向量检索：ColBERT + MaxSim"
     }
 
     func ensureEngine() async throws {
@@ -109,6 +122,38 @@ final class AppModel: ObservableObject {
         guard engine != nil else { throw DocSearchError.model("检索引擎初始化失败") }
     }
 
+    /// 决策判定路径：BM25 从原文切片表召回 → 决策模型逐片判定 → 取分数最高 topN。
+    private func decisionSearch(query: String) async throws -> [SearchHit] {
+        let cfg = config
+        if decisionJudge == nil {
+            let judge = try await Task.detached(priority: .userInitiated) {
+                try await DecisionJudge.load(modelPath: cfg.decisionModelPath,
+                                             batchSize: cfg.decisionBatchSize,
+                                             chunkChars: cfg.decisionChunkChars)
+            }.value
+            decisionJudge = judge
+        }
+        guard let judge = decisionJudge else { throw DocSearchError.model("决策模型初始化失败") }
+
+        let dbPath = cfg.databasePath
+        let recall = max(1, cfg.decisionRecallCount)
+
+        // 判定较重（4B 模型逐批前向），放后台线程避免阻塞 UI。
+        let verdicts = try await Task.detached(priority: .userInitiated) {
+            let db = try SQLiteDB(path: dbPath)
+            try SearchEngine.createSchema(db)
+            let slices = try SearchEngine.bm25Slices(db: db, query: query, limit: recall)
+            return try await judge.judge(query: query, slices: slices, topN: cfg.resultTopN)
+        }.value
+
+        return verdicts.map { verdict in
+            let slice = verdict.slice
+            return SearchHit(docID: slice.docID, title: slice.title, content: slice.content,
+                             score: verdict.probability, vectorRank: nil,
+                             bm25Rank: slice.bm25Rank, rrf: 0)
+        }
+    }
+
     func send() async {
         let query = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty, !isSearching else { return }
@@ -118,24 +163,33 @@ final class AppModel: ObservableObject {
         status = "检索中…"
         defer { isSearching = false }
         do {
-            try await ensureEngine()
-            guard let engine else { throw DocSearchError.model("检索引擎初始化失败") }
             let q = query
-            let topN = config.resultTopN
-            let coarse = config.coarseCount
-            let useANN = config.useANN
-            let nprobe = config.nprobe
-            let rescore = config.rescore
-            let minScoreRatio = config.effectiveMinScoreRatio
-            // 检索含 ONNX 推理与 MaxSim 重排，放到后台线程，避免阻塞 @MainActor 的 UI。
-            let hits = try await Task.detached(priority: .userInitiated) {
-                try engine.search(query: q, topN: topN, coarse: coarse,
-                                  useANN: useANN, nprobe: nprobe, rescore: rescore,
-                                  minScoreRatio: minScoreRatio)
-            }.value
+            let hits: [SearchHit]
+            if searchMode == "decision" {
+                status = "决策判定：初始化模型…"
+                hits = try await decisionSearch(query: q)
+            } else {
+                try await ensureEngine()
+                guard let engine else { throw DocSearchError.model("检索引擎初始化失败") }
+                let topN = config.resultTopN
+                let coarse = config.coarseCount
+                let useANN = config.useANN
+                let nprobe = config.nprobe
+                let rescore = config.rescore
+                let minScoreRatio = config.effectiveMinScoreRatio
+                // 检索含 ONNX 推理与 MaxSim 重排，放到后台线程，避免阻塞 @MainActor 的 UI。
+                hits = try await Task.detached(priority: .userInitiated) {
+                    try engine.search(query: q, topN: topN, coarse: coarse,
+                                      useANN: useANN, nprobe: nprobe, rescore: rescore,
+                                      minScoreRatio: minScoreRatio)
+                }.value
+            }
             messages.append(ChatBubbleItem(
                 role: .assistant,
-                text: hits.isEmpty ? "没有召回相关分片。" : "召回 \(hits.count) 个分片，点击气泡阅读：",
+                text: hits.isEmpty ? "没有召回相关分片。"
+                    : searchMode == "decision"
+                        ? "决策判定召回 \(hits.count) 个相关分片（按判定分数排序），点击气泡阅读："
+                        : "召回 \(hits.count) 个分片，点击气泡阅读：",
                 hits: hits))
             status = "检索完成：\(hits.count) 个分片"
         } catch {

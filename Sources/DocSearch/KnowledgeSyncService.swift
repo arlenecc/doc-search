@@ -91,8 +91,27 @@ final class KnowledgeSyncService {
                 fraction: Double(index + 1) / Double(max(1, successes.count))))
             do {
                 let title = (item.source.lastPathComponent as NSString).deletingPathExtension
+                let fileName = item.source.lastPathComponent
+                let fileBase = Double(index) / Double(max(1, successes.count))
+                let fileSpan = 1.0 / Double(max(1, successes.count))
+                var lastReported = -5
+                // 大文件切片很多时给 UI 报进度，但不写日志，避免日志刷屏。
+                let ingestProgress: (Int, Int) -> Void = { done, total in
+                    guard done == total || done - lastReported >= 5 else { return }
+                    lastReported = done
+                    let inner = Double(done) / Double(max(1, total))
+                    let info = SyncProgressInfo(
+                        phase: "切片入库",
+                        completed: done,
+                        total: total,
+                        fileName: fileName,
+                        message: "词向量与 4bit 残差 \(done)/\(total)",
+                        fraction: fileBase + inner * fileSpan)
+                    Task { @MainActor in progress(info) }
+                }
                 result.chunks += try engine.addFile(path: url.path, title: title,
                                                     bits: config.quantBits,
+                                                    progress: ingestProgress,
                                                     cancelled: { [weak self] in self?.isCancelled ?? false })
             } catch is CancellationError {
                 throw CancellationError()

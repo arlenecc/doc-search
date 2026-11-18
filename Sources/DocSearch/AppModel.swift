@@ -141,6 +141,7 @@ final class AppModel: ObservableObject {
         } catch {
             messages.append(ChatBubbleItem(role: .assistant, text: "检索失败：\(error.localizedDescription)"))
             status = "检索失败：\(error.localizedDescription)"
+            AppLog.shared.log("[检索] 失败：\(error.localizedDescription)")
         }
     }
 
@@ -152,23 +153,33 @@ final class AppModel: ObservableObject {
         isSyncing = true
         syncStatus = "准备同步…"
         syncFraction = 0
+        AppLog.shared.log("[同步] 开始")
         defer { isSyncing = false }
+        var lastLoggedPhase = ""
         do {
             let report = try await syncService.run(config: config) { info in
                 self.syncStatus = "\(info.phase)：\(info.fileName.isEmpty ? info.message : info.fileName)"
                 self.syncFraction = info.fraction
+                // 只在处理阶段切换时记一条，避免逐文件刷屏。
+                if info.phase != lastLoggedPhase {
+                    AppLog.shared.log("[同步] 进入 \(info.phase)")
+                    lastLoggedPhase = info.phase
+                }
             }
             lastReport = report
             syncStatus = report.message
             syncFraction = 1
             status = report.message
+            AppLog.shared.log("[同步] 完成：文件 \(report.succeeded)/\(report.files)，切片 \(report.chunks)，跳过 \(report.skipped)")
             engine = nil
         } catch is CancellationError {
             syncStatus = "同步已停止"
             status = "同步已停止"
+            AppLog.shared.log("[同步] 已停止")
         } catch {
             syncStatus = "同步失败：\(error.localizedDescription)"
             status = syncStatus
+            AppLog.shared.log("[同步] 失败：\(error.localizedDescription)")
         }
     }
 

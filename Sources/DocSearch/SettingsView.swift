@@ -17,8 +17,11 @@ struct SettingsView: View {
             Form {
                 Section("知识同步") {
                     pathField("源目录", text: $draft.sourceDirectory, chooseDirectory: true)
-                    pathField("Markdown 输出目录", text: $draft.outputDirectory, chooseDirectory: true)
-                    pathField("数据库文件", text: $draft.databasePath, chooseDirectory: false)
+                    pathField("工作目录", text: $draft.workDirectory, chooseDirectory: true)
+                    Text("Markdown：\(draft.outputDirectory)\n数据库：\(draft.databasePath)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
                     pathField("ColBERT 模型目录", text: $draft.modelDirectory, chooseDirectory: true)
                     Toggle("增量转换（源文件未变化时跳过）", isOn: $draft.incrementalConversion)
                     Stepper("并发数 \(draft.syncConcurrency)", value: $draft.syncConcurrency, in: 1...8)

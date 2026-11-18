@@ -2,10 +2,12 @@ import SwiftUI
 
 extension Notification.Name {
     static let docSearchOpenSettings = Notification.Name("docSearch.openSettings")
+    static let docSearchOpenLog = Notification.Name("docSearch.openLog")
 }
 
 struct RootView: View {
     @EnvironmentObject var model: AppModel
+    @Environment(\.openWindow) private var openWindow
     @State private var showSettings = false
 
     var body: some View {
@@ -71,6 +73,16 @@ struct RootView: View {
             .frame(minWidth: 260)
         } detail: {
             ChatView()
+                .toolbar {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button {
+                            openWindow(id: "docsearch-log")
+                        } label: {
+                            Label("日志", systemImage: "doc.text.magnifyingglass")
+                        }
+                        .help("打开实时日志窗口")
+                    }
+                }
         }
         .sheet(isPresented: $showSettings) {
             SettingsView(config: model.config) { newConfig in
@@ -85,6 +97,9 @@ struct RootView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .docSearchOpenSettings)) { _ in
             showSettings = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .docSearchOpenLog)) { _ in
+            openWindow(id: "docsearch-log")
         }
     }
 }

@@ -27,7 +27,7 @@ enum DocSearchCLI {
             return
         }
 
-        let dbPath = value(options, "db", "doc_search.db")
+        let dbPath = value(options, "db", config.databasePath)
         let modelDir = value(options, "model", ProcessInfo.processInfo.environment["DOCSEARCH_MODEL"] ?? config.modelDirectory)
 
         switch command {
@@ -65,18 +65,14 @@ enum DocSearchCLI {
             let engine = SearchEngine(db: db, colbert: colbert)
             let topN = Int(options["top"] ?? "5") ?? 5
             let coarse = Int(options["coarse"] ?? "20") ?? 20
-            var timings: [String: Double] = [:]
-            let sink: (String, Double) -> Void = { key, value in timings[key] = value }
             let hits = try engine.search(
                 query: query, topN: topN, coarse: coarse,
                 useANN: options["exact"] == nil,
                 nprobe: Int(options["nprobe"] ?? "") ?? ANNIndex.defaultNprobe,
                 rescore: Int(options["rescore"] ?? "") ?? ANNIndex.defaultRescore,
                 forceANN: options["force-ann"] != nil,
-                minScoreRatio: Double(options["min-score-ratio"] ?? "") ?? 0.9,
-                timing: options["timing"] != nil ? sink : nil)
+                minScoreRatio: Double(options["min-score-ratio"] ?? "") ?? 0.9)
             print("问句: \(query)  (粗筛 \(coarse) 条 / 返回 \(hits.count) 条 / 向量通道 \(engine.lastVectorBackend))")
-            if options["timing"] != nil { printTiming(timings, prefix: "检索") }
             for (i, hit) in hits.enumerated() {
                 let vec = hit.vectorRank.map(String.init) ?? "-"
                 let bm = hit.bm25Rank.map(String.init) ?? "-"
@@ -88,8 +84,15 @@ enum DocSearchCLI {
         case "sync":
             var cfg = ToolConfig.load()
             if let value = options["source"] { cfg.sourceDirectory = value }
-            if let value = options["output"] { cfg.outputDirectory = value }
-            if let value = options["db"] { cfg.databasePath = value }
+            if let value = options["workdir"] {
+                cfg.workDirectory = value
+            } else if let value = options["output"] {
+                cfg.workDirectory = (value as NSString).deletingLastPathComponent
+            } else if let value = options["db"] {
+                let parent = (value as NSString).deletingLastPathComponent
+                cfg.workDirectory = (parent as NSString).lastPathComponent == "db"
+                    ? (parent as NSString).deletingLastPathComponent : parent
+            }
             if let value = options["model"] { cfg.modelDirectory = value }
             if let value = options["bits"] { cfg.quantBits = Int(value) ?? 4 }
             if let value = options["threads"] { cfg.syncConcurrency = Int(value) ?? 3 }
@@ -655,10 +658,10 @@ enum DocSearchCLI {
     private static let usage = """
     doc_search — ColBERT 问句直接检索长文档（独立 Swift 工具）
 
-      swift run -c release DocSearch sync  --source 源目录 [--output MD目录] [--db PATH] [--bits 4] [--threads 3]
+      swift run -c release DocSearch sync  --source 源目录 [--workdir 工作目录] [--bits 4] [--threads 3]
       swift run -c release DocSearch init  --db PATH
       swift run -c release DocSearch add   --db PATH --file 文本_path [--title 标题] [--bits 4] [--model DIR] [--timing]
-      swift run -c release DocSearch search --db PATH --query "问句" [--top 5] [--coarse 20] [--nprobe 32] [--rescore 64] [--min-score-ratio 0.9] [--exact] [--force-ann] [--timing]
+      swift run -c release DocSearch search --db PATH --query "问句" [--top 5] [--coarse 20] [--nprobe 32] [--rescore 64] [--min-score-ratio 0.9] [--exact] [--force-ann]
       swift run -c release DocSearch db-stats --db PATH
       swift run -c release DocSearch ann-status --db PATH
       swift run -c release DocSearch ann-build  --db PATH [--clusters 512] [--cluster-size 512] [--iterations 8] [--force]
@@ -673,5 +676,8 @@ enum DocSearchCLI {
     默认模型: 配置 modelDirectory（首次默认 \(defaultModel)；可用 --model 或 DOCSEARCH_MODEL 覆盖；也支持 --key=value 参数）
     表: document / doc_summary_vec(vec0) / doc_residuals；索引: document_fts(BM25) + ann_blocks/ann_cells(ANN)
     大库（≥20000 切片）且 ANN 可用时自动走 ANN 粗筛，小库走 vec0 精确检索
+    每次检索返回前自动打印整体耗时与各阶段耗时（无需 --timing；该参数保留兼容但已忽略）
+    配置只保留一个工作目录：Markdown = 工作目录/markdown，数据库 = 工作目录/db/doc_search.db
+    sync 的旧参数 --output/--db 仍接受，会自动换算成工作目录；CLI 的 --db 仍可临时指定检索库
     """
 }

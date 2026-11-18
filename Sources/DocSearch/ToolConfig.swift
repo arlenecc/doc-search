@@ -1,11 +1,27 @@
 import Foundation
 
 /// 独立工具配置：只保留知识同步与检索阅读相关设置，JSON 持久化。
-struct ToolConfig: Codable {
+struct ToolConfig {
     var sourceDirectory = ""
-    var outputDirectory = ""
-    var databasePath = ""
+    /// 唯一的工作目录：Markdown 输出为 <工作目录>/markdown，数据库为 <工作目录>/db/doc_search.db。
+    var workDirectory = ""
     var modelDirectory = "/Volumes/SSD/embedding&reranker/jina-colbert-v2-64-onnx-int8"
+
+    var expandedWorkDirectory: String {
+        let raw = workDirectory.isEmpty ? Self.defaultWorkDirectory() : workDirectory
+        return (raw as NSString).expandingTildeInPath
+    }
+
+    var outputDirectory: String {
+        URL(fileURLWithPath: expandedWorkDirectory, isDirectory: true)
+            .appendingPathComponent("markdown", isDirectory: true).path
+    }
+
+    var databasePath: String {
+        URL(fileURLWithPath: expandedWorkDirectory, isDirectory: true)
+            .appendingPathComponent("db", isDirectory: true)
+            .appendingPathComponent("doc_search.db").path
+    }
 
     // 知识同步
     var syncConcurrency = 3
@@ -55,37 +71,108 @@ struct ToolConfig: Codable {
         min(max(minScoreRatio ?? 0.9, 0.0), 1.0)
     }
 
+    static func defaultWorkDirectory() -> String {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("DocSearch", isDirectory: true).path
+    }
+
     static func defaultPaths() -> ToolConfig {
         var config = ToolConfig()
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory,
-                                                  in: .userDomainMask).first!
-            .appendingPathComponent("DocSearch", isDirectory: true)
-        config.outputDirectory = appSupport.appendingPathComponent("markdown", isDirectory: true).path
-        config.databasePath = appSupport.appendingPathComponent("doc_search.db").path
+        config.workDirectory = defaultWorkDirectory()
         return config
     }
 
     static var configURL: URL {
-        let root = FileManager.default.urls(for: .applicationSupportDirectory,
-                                            in: .userDomainMask).first!
-            .appendingPathComponent("DocSearch", isDirectory: true)
-        return root.appendingPathComponent("config.json")
+        URL(fileURLWithPath: defaultWorkDirectory()).appendingPathComponent("config.json")
     }
 
     static func load() -> ToolConfig {
         var result = defaultPaths()
-        guard let data = try? Data(contentsOf: configURL),
-              let decoded = try? JSONDecoder().decode(ToolConfig.self, from: data) else { return result }
-        result = decoded
-        // 兼容旧配置文件：空路径补默认值。
-        if result.outputDirectory.isEmpty { result.outputDirectory = defaultPaths().outputDirectory }
-        if result.databasePath.isEmpty { result.databasePath = defaultPaths().databasePath }
-        if result.modelDirectory.isEmpty { result.modelDirectory = defaultPaths().modelDirectory }
         var changed = false
+        var hasNewWorkDir = false
+        var legacyDatabasePath: String?
+        if let data = try? Data(contentsOf: configURL),
+           let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            for (key, value) in dict {
+                switch key {
+                case "sourceDirectory": result.sourceDirectory = value as? String ?? result.sourceDirectory
+                case "workDirectory":
+                    if let string = value as? String, !string.isEmpty {
+                        result.workDirectory = string
+                        hasNewWorkDir = true
+                    }
+                case "outputDirectory":
+                    if !hasNewWorkDir, let string = value as? String, !string.isEmpty {
+                        result.workDirectory = (string as NSString).deletingLastPathComponent
+                        changed = true
+                    }
+                case "databasePath":
+                    if let string = value as? String, !string.isEmpty {
+                        legacyDatabasePath = string
+                        if !hasNewWorkDir {
+                            let ns = string as NSString
+                            let parent = ns.deletingLastPathComponent
+                            result.workDirectory = (parent as NSString).lastPathComponent == "db"
+                                ? (parent as NSString).deletingLastPathComponent : parent
+                            changed = true
+                        }
+                    }
+                case "modelDirectory": result.modelDirectory = value as? String ?? result.modelDirectory
+                case "syncConcurrency": result.syncConcurrency = value as? Int ?? result.syncConcurrency
+                case "incrementalConversion": result.incrementalConversion = value as? Bool ?? result.incrementalConversion
+                case "parseRenderDPI": result.parseRenderDPI = value as? Double ?? result.parseRenderDPI
+                case "parseMaxPages": result.parseMaxPages = value as? Int ?? result.parseMaxPages
+                case "parsePreprocessOCR": result.parsePreprocessOCR = value as? Bool ?? result.parsePreprocessOCR
+                case "parseBinarizeOCR": result.parseBinarizeOCR = value as? Bool ?? result.parseBinarizeOCR
+                case "parseKeepHeadersFooters": result.parseKeepHeadersFooters = value as? Bool ?? result.parseKeepHeadersFooters
+                case "pdfOCREngine": result.pdfOCREngine = value as? String ?? result.pdfOCREngine
+                case "epubOCREngine": result.epubOCREngine = value as? String ?? result.epubOCREngine
+                case "ocrBackend": result.ocrBackend = value as? String ?? result.ocrBackend
+                case "ovisModelPath": result.ovisModelPath = value as? String ?? result.ovisModelPath
+                case "ocrMMProjPath": result.ocrMMProjPath = value as? String ?? result.ocrMMProjPath
+                case "ovisInstances": result.ovisInstances = value as? Int ?? result.ovisInstances
+                case "chunkMinChars": result.chunkMinChars = value as? Int ?? result.chunkMinChars
+                case "chunkMaxChars": result.chunkMaxChars = value as? Int ?? result.chunkMaxChars
+                case "chunkOverlapRatio": result.chunkOverlapRatio = value as? Double ?? result.chunkOverlapRatio
+                case "semanticThreshold": result.semanticThreshold = value as? Double ?? result.semanticThreshold
+                case "semanticFloor": result.semanticFloor = value as? Double ?? result.semanticFloor
+                case "usePotionSemantic": result.usePotionSemantic = value as? Bool ?? result.usePotionSemantic
+                case "potionModelPath": result.potionModelPath = value as? String ?? result.potionModelPath
+                case "quantBits": result.quantBits = value as? Int ?? result.quantBits
+                case "resultTopN": result.resultTopN = value as? Int ?? result.resultTopN
+                case "coarseCount": result.coarseCount = value as? Int ?? result.coarseCount
+                case "nprobe": result.nprobe = value as? Int ?? result.nprobe
+                case "rescore": result.rescore = value as? Int ?? result.rescore
+                case "annClusters": result.annClusters = value as? Int ?? result.annClusters
+                case "annClusterSize": result.annClusterSize = value as? Int ?? result.annClusterSize
+                case "useANN": result.useANN = value as? Bool ?? result.useANN
+                case "minScoreRatio": result.minScoreRatio = value as? Double
+                default: break
+                }
+            }
+            // 旧数据库位于 <工作目录>/doc_search.db，迁移到 <工作目录>/db/doc_search.db。
+            if let legacy = legacyDatabasePath,
+               FileManager.default.fileExists(atPath: legacy),
+               !FileManager.default.fileExists(atPath: result.databasePath) {
+                let fm = FileManager.default
+                try? fm.createDirectory(atPath: (result.databasePath as NSString).deletingLastPathComponent,
+                                        withIntermediateDirectories: true)
+                try? fm.moveItem(atPath: legacy, toPath: result.databasePath)
+                for suffix in ["-wal", "-shm"] {
+                    try? fm.moveItem(atPath: legacy + suffix, toPath: result.databasePath + suffix)
+                }
+                changed = true
+            }
+        }
+        if result.workDirectory.isEmpty { result.workDirectory = Self.defaultWorkDirectory() }
+        let fm = FileManager.default
+        try? fm.createDirectory(atPath: result.expandedWorkDirectory, withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: (result.databasePath as NSString).deletingLastPathComponent,
+                                withIntermediateDirectories: true)
+        if result.modelDirectory.isEmpty { result.modelDirectory = defaultPaths().modelDirectory }
         // 旧配置里的 1% 是历史默认值，按本次调整迁移到 1.5%。
         if result.chunkOverlapRatio == 0.01 { result.chunkOverlapRatio = 0.015; changed = true }
         // 模型目录可能被移动到常见落点；配置的旧路径失效时自动纠正，避免检索直接报错。
-        let fm = FileManager.default
         if !fm.fileExists(atPath: result.modelDirectory + "/tokenizer.json") {
             let name = (result.modelDirectory as NSString).lastPathComponent
             let home = fm.homeDirectoryForCurrentUser
@@ -112,7 +199,43 @@ struct ToolConfig: Codable {
            let workspace = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
             copy.sourceDirectory = workspace.path
         }
-        guard let data = try? JSONEncoder().encode(copy) else { return }
+        if copy.workDirectory.isEmpty { copy.workDirectory = Self.defaultWorkDirectory() }
+        var dict: [String: Any] = [
+            "sourceDirectory": copy.sourceDirectory,
+            "workDirectory": copy.workDirectory,
+            "modelDirectory": copy.modelDirectory,
+            "syncConcurrency": copy.syncConcurrency,
+            "incrementalConversion": copy.incrementalConversion,
+            "parseRenderDPI": copy.parseRenderDPI,
+            "parseMaxPages": copy.parseMaxPages,
+            "parsePreprocessOCR": copy.parsePreprocessOCR,
+            "parseBinarizeOCR": copy.parseBinarizeOCR,
+            "parseKeepHeadersFooters": copy.parseKeepHeadersFooters,
+            "pdfOCREngine": copy.pdfOCREngine,
+            "epubOCREngine": copy.epubOCREngine,
+            "ocrBackend": copy.ocrBackend,
+            "ovisModelPath": copy.ovisModelPath,
+            "ocrMMProjPath": copy.ocrMMProjPath,
+            "ovisInstances": copy.ovisInstances,
+            "chunkMinChars": copy.chunkMinChars,
+            "chunkMaxChars": copy.chunkMaxChars,
+            "chunkOverlapRatio": copy.chunkOverlapRatio,
+            "semanticThreshold": copy.semanticThreshold,
+            "semanticFloor": copy.semanticFloor,
+            "usePotionSemantic": copy.usePotionSemantic,
+            "potionModelPath": copy.potionModelPath,
+            "quantBits": copy.quantBits,
+            "resultTopN": copy.resultTopN,
+            "coarseCount": copy.coarseCount,
+            "nprobe": copy.nprobe,
+            "rescore": copy.rescore,
+            "annClusters": copy.annClusters,
+            "annClusterSize": copy.annClusterSize,
+            "useANN": copy.useANN,
+        ]
+        if let minScoreRatio = copy.minScoreRatio { dict["minScoreRatio"] = minScoreRatio }
+        guard JSONSerialization.isValidJSONObject(dict),
+              let data = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]) else { return }
         try? FileManager.default.createDirectory(at: Self.configURL.deletingLastPathComponent(),
                                                  withIntermediateDirectories: true)
         try? data.write(to: Self.configURL, options: .atomic)

@@ -210,15 +210,37 @@ final class SearchEngine {
                 useANN: Bool = true, nprobe: Int = ANNIndex.defaultNprobe,
                 rescore: Int = ANNIndex.defaultRescore, forceANN: Bool = false,
                 minScoreRatio: Double = 0.9,
-                timing: ((String, Double) -> Void)? = nil) throws -> [SearchHit] {
-        guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
+                timing externalTiming: ((String, Double) -> Void)? = nil) throws -> [SearchHit] {
         let searchStarted = Date()
+        var localTimings: [String: Double] = [:]
+        var entered = false
+        var resultCount = 0
+        let timing: ((String, Double) -> Void)? = { key, value in
+            localTimings[key] = value
+            externalTiming?(key, value)
+        }
+        // 任何返回路径（含提前返回与抛错）都打印本次检索耗时。
+        defer {
+            if localTimings["search_total"] == nil {
+                localTimings["search_total"] = Date().timeIntervalSince(searchStarted)
+            }
+            Self.printSearchTimings(localTimings)
+            if entered {
+                let total = localTimings["search_total"] ?? 0
+                AppLog.shared.log(String(format: "[检索] 结束：返回 %d 条 · 总耗时 %.3fs",
+                                         resultCount, total))
+            }
+        }
+        guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
+        entered = true
+        AppLog.shared.log("[检索] 进入：\(query)")
         var stage = Date()
         let encodedQuery = try colbert.queryEncoding(query)
         let center = encodedQuery.center
         let queryElapsed = Date().timeIntervalSince(stage)
         timing?("query_center", queryElapsed)
         timing?("query_tokens", queryElapsed)
+        AppLog.shared.log(String(format: "[检索] 查询编码完成 %.3fs", queryElapsed))
         let fetchK = max(60, coarse * 3)
         var candidates: [String: Candidate] = [:]
 
@@ -291,7 +313,10 @@ final class SearchEngine {
             return $0.docID < $1.docID
         }.prefix(max(1, coarse))
         timing?("rrf", Date().timeIntervalSince(stage))
-        timing?("coarse_total", Date().timeIntervalSince(searchStarted))
+        let coarseElapsed = Date().timeIntervalSince(searchStarted)
+        timing?("coarse_total", coarseElapsed)
+        AppLog.shared.log(String(format: "[检索] 粗排完成 %.3fs（候选 %d）",
+                                 coarseElapsed, shortlist.count))
 
         let queryTokens = encodedQuery.tokens
         guard !queryTokens.isEmpty else { return [] }
@@ -319,10 +344,42 @@ final class SearchEngine {
         }
         timing?("residual_load", loadTotal)
         timing?("maxsim", maxsimTotal)
-        timing?("rerank", loadTotal + maxsimTotal)
+        let rerankElapsed = loadTotal + maxsimTotal
+        timing?("rerank", rerankElapsed)
         timing?("shortlist", Double(shortlist.count))
+        let final = Array(result.prefix(max(1, topN)))
+        resultCount = final.count
         timing?("search_total", Date().timeIntervalSince(searchStarted))
-        return Array(result.prefix(max(1, topN)))
+        AppLog.shared.log(String(format: "[检索] 精排完成 %.3fs", rerankElapsed))
+        return final
+    }
+
+    /// 每次检索返回前统一打印整体与各阶段耗时。
+    private static func printSearchTimings(_ values: [String: Double]) {
+        let order: [(String, String)] = [
+            ("search_total", "整体耗时"),
+            ("query_center", "查询编码/中心"),
+            ("query_tokens", "查询 token（同一次推理）"),
+            ("vector_coarse", "向量粗排"),
+            ("bm25_coarse", "BM25 粗排"),
+            ("rrf", "RRF 融合"),
+            ("coarse_total", "粗排合计"),
+            ("residual_load", "残差读取"),
+            ("maxsim", "MaxSim 计算"),
+            ("rerank", "重排合计"),
+            ("shortlist", "精排候选数"),
+        ]
+        // 详细计时仍完整输出到控制台，但不进 GUI 日志窗口，避免刷屏。
+        print("  [检索计时]")
+        for (key, label) in order {
+            guard let value = values[key] else { continue }
+            if key == "shortlist" {
+                print("    \(label)=\(Int(value))")
+            } else {
+                let padded = label.padding(toLength: 24, withPad: " ", startingAt: 0)
+                print(String(format: "    %@ %.4f s", padded, value))
+            }
+        }
     }
 
     private func loadMeta(_ docID: String) throws -> (title: String, content: String)? {

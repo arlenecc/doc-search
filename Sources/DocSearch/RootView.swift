@@ -41,6 +41,7 @@ struct RootView: View {
                             .disabled(model.isSyncing)
                         Button("停止") { model.stopSync() }
                             .disabled(!model.isSyncing)
+                        Button("查看文件") { openWindow(id: "docsearch-files") }
                     }
                     if let report = model.lastReport {
                         Text("文件 \(report.succeeded)/\(report.files) · 切片 \(report.chunks) · 跳过 \(report.skipped)")

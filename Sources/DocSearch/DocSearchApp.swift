@@ -16,6 +16,11 @@ struct DocSearchApp: App {
             LogWindowView()
         }
         .defaultSize(width: 900, height: 620)
+        Window("Markdown 文件", id: "docsearch-files") {
+            MarkdownFilesView()
+                .environmentObject(model)
+        }
+        .defaultSize(width: 760, height: 560)
         .commands {
             CommandGroup(replacing: .appSettings) {
                 Button("配置…") {

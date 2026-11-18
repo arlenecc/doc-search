@@ -6,8 +6,8 @@ struct ToolConfig {
     /// 唯一的工作目录：Markdown 输出为 <工作目录>/markdown，数据库为 <工作目录>/db/doc_search.db。
     var workDirectory = ""
     var modelDirectory = "/Volumes/SSD/embedding&reranker/jina-colbert-v2-64-onnx-int8"
-    /// 决策判定模型目录（karpo-decision-4B-mlx-int4，含 readout.safetensors）。
-    var decisionModelPath = "/Volumes/SSD/Decision Model/karpo-decision-4B-mlx-int4"
+    /// 决策判定模型目录（默认 karpo-decision-0.8B-mlx-int4，含 readout.safetensors）。
+    var decisionModelPath = "/Volumes/SSD/Decision Model/karpo-decision-0.8B-mlx-int4"
     /// 检索路径：vector=向量检索（默认），decision=BM25 召回 + 决策模型判定。
     var searchMode = "vector"
     /// 决策模式 BM25 召回切片数。
@@ -16,6 +16,8 @@ struct ToolConfig {
     var decisionBatchSize = 8
     /// 决策模式每片送入判定的最大正文字数。
     var decisionChunkChars = 160
+    /// 决策模式每个切片提取的核心句数量。
+    var decisionCoreSentences = 3
 
     var expandedWorkDirectory: String {
         let raw = workDirectory.isEmpty ? Self.defaultWorkDirectory() : workDirectory
@@ -55,6 +57,10 @@ struct ToolConfig {
     var ovisInstances = 2
 
     // 切片 / 词向量 / 残差
+    /// 是否启用向量检索模式。关闭时同步只入库文本切片（供决策判定用），不计算词向量/残差以节省空间。
+    var useVectorSearch = true
+    /// 后台词向量回填并发/线程数。
+    var vectorBackfillThreads = 2
     var chunkMinChars = 2500
     var chunkMaxChars = 3000
     var chunkOverlapRatio = 0.015
@@ -133,6 +139,7 @@ struct ToolConfig {
                 case "decisionRecallCount": result.decisionRecallCount = value as? Int ?? result.decisionRecallCount
                 case "decisionBatchSize": result.decisionBatchSize = value as? Int ?? result.decisionBatchSize
                 case "decisionChunkChars": result.decisionChunkChars = value as? Int ?? result.decisionChunkChars
+                case "decisionCoreSentences": result.decisionCoreSentences = value as? Int ?? result.decisionCoreSentences
                 case "syncConcurrency": result.syncConcurrency = value as? Int ?? result.syncConcurrency
                 case "incrementalConversion": result.incrementalConversion = value as? Bool ?? result.incrementalConversion
                 case "parseRenderDPI": result.parseRenderDPI = value as? Double ?? result.parseRenderDPI
@@ -154,6 +161,8 @@ struct ToolConfig {
                 case "usePotionSemantic": result.usePotionSemantic = value as? Bool ?? result.usePotionSemantic
                 case "potionModelPath": result.potionModelPath = value as? String ?? result.potionModelPath
                 case "quantBits": result.quantBits = value as? Int ?? result.quantBits
+                case "useVectorSearch": result.useVectorSearch = value as? Bool ?? result.useVectorSearch
+                case "vectorBackfillThreads": result.vectorBackfillThreads = value as? Int ?? result.vectorBackfillThreads
                 case "resultTopN": result.resultTopN = value as? Int ?? result.resultTopN
                 case "coarseCount": result.coarseCount = value as? Int ?? result.coarseCount
                 case "nprobe": result.nprobe = value as? Int ?? result.nprobe
@@ -189,6 +198,12 @@ struct ToolConfig {
         if result.chunkOverlapRatio == 0.01 { result.chunkOverlapRatio = 0.015; changed = true }
         if result.chunkMinChars == 7500 { result.chunkMinChars = 2500; changed = true }
         if result.chunkMaxChars == 8000 { result.chunkMaxChars = 3000; changed = true }
+        // 决策模型默认从 4B 切到 0.8B：仅重写仍是旧默认路径的配置，显式自定义的不动。
+        if result.decisionModelPath == "/Volumes/SSD/Decision Model/karpo-decision-4B-mlx-int4",
+           fm.fileExists(atPath: defaultPaths().decisionModelPath + "/readout.safetensors") {
+            result.decisionModelPath = defaultPaths().decisionModelPath
+            changed = true
+        }
         // 模型目录可能被移动到常见落点；配置的旧路径失效时自动纠正，避免检索直接报错。
         if !fm.fileExists(atPath: result.modelDirectory + "/tokenizer.json") {
             let name = (result.modelDirectory as NSString).lastPathComponent
@@ -226,6 +241,7 @@ struct ToolConfig {
             "decisionRecallCount": copy.decisionRecallCount,
             "decisionBatchSize": copy.decisionBatchSize,
             "decisionChunkChars": copy.decisionChunkChars,
+            "decisionCoreSentences": copy.decisionCoreSentences,
             "syncConcurrency": copy.syncConcurrency,
             "incrementalConversion": copy.incrementalConversion,
             "parseRenderDPI": copy.parseRenderDPI,
@@ -247,6 +263,8 @@ struct ToolConfig {
             "usePotionSemantic": copy.usePotionSemantic,
             "potionModelPath": copy.potionModelPath,
             "quantBits": copy.quantBits,
+            "useVectorSearch": copy.useVectorSearch,
+            "vectorBackfillThreads": copy.vectorBackfillThreads,
             "resultTopN": copy.resultTopN,
             "coarseCount": copy.coarseCount,
             "nprobe": copy.nprobe,

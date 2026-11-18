@@ -120,7 +120,7 @@ final class SearchEngine {
             throw DocSearchError.argument("无法读取 UTF-8 文本文件: \(path)")
         }
         let base = ((path as NSString).lastPathComponent as NSString).deletingPathExtension
-        let sourceID = base + "-" + hash8(text)
+        let sourceID = base + "-" + Self.hash8(text)
         let docTitle = title ?? base
         let addStarted = Date()
         let chunks = try Chunker.split(text, sourceName: docTitle, model: colbert, options: options)
@@ -130,28 +130,9 @@ final class SearchEngine {
 
         var pruneTotal = 0.0, encodeTotal = 0.0, quantTotal = 0.0, dbTotal = 0.0
         var termTotal = 0, tokenTotal = 0
-        let ann = ANNIndex(db: db)
 
         // 清理旧切片单独成事务：只删不编码，避免长事务把 ONNX 推理也包进去。
-        try db.transaction {
-            let old = try db.query("SELECT doc_id, rowid FROM document WHERE doc_id LIKE ?",
-                                   [.text(sourceID + "#%")])
-            var staleIDs: [Int64] = []
-            for row in old {
-                guard let id = row["doc_id"]?.stringValue else { continue }
-                if let rowID = row["rowid"]?.intValue {
-                    staleIDs.append(rowID)
-                    try db.execute("DELETE FROM doc_summary_vec WHERE rowid = ?", [.int(rowID)])
-                    try db.execute("DELETE FROM doc_vectors WHERE rowid = ?", [.int(rowID)])
-                }
-                try db.execute("DELETE FROM document WHERE doc_id = ?", [.text(id)])
-                try db.execute("DELETE FROM document_fts WHERE doc_id = ?", [.text(id)])
-                try db.execute("DELETE FROM doc_residuals WHERE doc_id = ?", [.text(id)])
-            }
-            try ann.recordStale(rowIDs: staleIDs)
-            let previous = Int(Self.meta(db, "doc_count") ?? "") ?? 0
-            Self.setMeta(db, "doc_count", String(max(0, previous - old.count)))
-        }
+        try Self.deleteChunks(db: db, sourceID: sourceID)
 
         // 逐片编码、逐片提交：取消能及时响应，写锁也不再覆盖整个文件。
         var added = 0
@@ -253,6 +234,151 @@ final class SearchEngine {
         externalTiming?("decision_bm25", elapsed)
         AppLog.shared.log(String(format: "[决策检索] BM25 召回完成 %.3fs（候选 %d）", elapsed, slices.count))
         return slices
+    }
+
+    // MARK: - 纯文本切片入库 / 后台词向量回填
+
+    struct BackfillReport {
+        var filled = 0
+        var skipped = 0
+        var total = 0
+        var failed: String? = nil
+    }
+
+    /// 只把文档切成文本切片写入 document + document_fts，不计算任何词向量。
+    /// 供决策判定模式即时可用；词向量/残差由 backfillVectors 后台补。
+    static func addFileTextOnly(db: SQLiteDB, options: ChunkOptions,
+                                path: String, title: String? = nil,
+                                progress: ((Int, Int) -> Void)? = nil,
+                                cancelled: (() -> Bool)? = nil) throws -> Int {
+        guard let data = FileManager.default.contents(atPath: path),
+              let text = String(data: data, encoding: .utf8) else {
+            throw DocSearchError.argument("无法读取 UTF-8 文本文件: \(path)")
+        }
+        let base = ((path as NSString).lastPathComponent as NSString).deletingPathExtension
+        let sourceID = base + "-" + Self.hash8(text)
+        let docTitle = title ?? base
+        // 语义切片若用 ColBERT 相似度会加载模型；纯文本入库传 nil，走 potion/词法回退。
+        let chunks = try Chunker.split(text, sourceName: docTitle, model: nil, options: options)
+        guard !chunks.isEmpty else { throw DocSearchError.chunking("没有产生任何切片") }
+
+        // 与 addFile 相同的旧切片清理（含向量表），保证重复同步不残留。
+        try Self.deleteChunks(db: db, sourceID: sourceID)
+
+        var added = 0
+        for (i, chunk) in chunks.enumerated() {
+            if cancelled?() == true { throw CancellationError() }
+            let id = String(format: "%@#%04d", sourceID, i)
+            try db.transaction {
+                let rowSeq = (Int64(Self.meta(db, "doc_rowid_seq") ?? "") ?? 0) + 1
+                try db.execute("INSERT INTO document(rowid,doc_id,title,content) VALUES(?,?,?,?)",
+                               [.int(rowSeq), .text(id), .text(chunk.title), .text(chunk.content)])
+                try db.execute("INSERT INTO document_fts(doc_id,title_tokens,content_tokens) VALUES(?,?,?)",
+                               [.text(id), .text(TextAnalysis.ftsIndexText(chunk.title)),
+                                .text(TextAnalysis.ftsIndexText(chunk.content))])
+                let count = Int(Self.meta(db, "doc_count") ?? "") ?? 0
+                Self.setMeta(db, "doc_count", String(count + 1))
+                Self.setMeta(db, "doc_rowid_seq", String(rowSeq))
+            }
+            added += 1
+            progress?(i + 1, chunks.count)
+        }
+        AppLog.shared.log(String(format: "[入库] 文本切片完成：%@ %d 片（词向量待后台填充）", docTitle, added))
+        return added
+    }
+
+    private static func deleteChunks(db: SQLiteDB, sourceID: String) throws {
+        let ann = ANNIndex(db: db)
+        try db.transaction {
+            let old = try db.query("SELECT doc_id, rowid FROM document WHERE doc_id LIKE ?",
+                                   [.text(sourceID + "#%")])
+            var staleIDs: [Int64] = []
+            for row in old {
+                guard let id = row["doc_id"]?.stringValue else { continue }
+                if let rowID = row["rowid"]?.intValue {
+                    staleIDs.append(rowID)
+                    try db.execute("DELETE FROM doc_summary_vec WHERE rowid = ?", [.int(rowID)])
+                    try db.execute("DELETE FROM doc_vectors WHERE rowid = ?", [.int(rowID)])
+                }
+                try db.execute("DELETE FROM document WHERE doc_id = ?", [.text(id)])
+                try db.execute("DELETE FROM document_fts WHERE doc_id = ?", [.text(id)])
+                try db.execute("DELETE FROM doc_residuals WHERE doc_id = ?", [.text(id)])
+            }
+            try ann.recordStale(rowIDs: staleIDs)
+            let previous = Int(Self.meta(db, "doc_count") ?? "") ?? 0
+            Self.setMeta(db, "doc_count", String(max(0, previous - old.count)))
+        }
+    }
+
+    /// 后台异步回填：扫描尚无词向量/残差的切片，计算词向量并写入向量表。
+    /// 每次调用处理一批（由 cancelled 控制），返回本批处理数量。
+    func backfillVectors(colbert: ColBERT, bits: Int, limit: Int = 20,
+                         progress: ((Int, Int) -> Void)? = nil,
+                         cancelled: (() -> Bool)? = nil) throws -> BackfillReport {
+        let rows = try db.query("""
+            SELECT d.doc_id AS doc_id, d.content AS content, d.rowid AS rowid
+            FROM document AS d
+            LEFT JOIN doc_residuals AS r ON r.doc_id = d.doc_id
+            WHERE r.doc_id IS NULL
+            LIMIT ?
+            """, [.int(Int64(max(1, limit)))])
+        guard !rows.isEmpty else { return BackfillReport() }
+        var report = BackfillReport(total: rows.count)
+        for row in rows {
+            if cancelled?() == true { throw CancellationError() }
+            guard let id = row["doc_id"]?.stringValue,
+                  let content = row["content"]?.stringValue,
+                  let rowID = row["rowid"]?.intValue else { report.skipped += 1; continue }
+            var terms = TokenPruner.shared.prune(content)
+            if terms.isEmpty { terms = TextAnalysis.words(content).filter { !TokenPruner.shared.isStopword($0) } }
+            guard !terms.isEmpty else {
+                // 无可编码词项：写一个空残差占位，避免回填反复扫到同一片。
+                try? writeEmptyResidual(docID: id)
+                report.skipped += 1
+                continue
+            }
+            do {
+                let vectors = try colbert.encodeTerms(terms)
+                let record = try ResidualCodec.quantize(docID: id, vectors: vectors,
+                                                        dim: ColBERT.dimension, bits: bits)
+                try db.transaction {
+                    try db.execute("INSERT OR REPLACE INTO doc_summary_vec(rowid,embedding) VALUES(?,?)",
+                                   [.int(rowID), .floats(record.center)])
+                    try db.execute("INSERT OR REPLACE INTO doc_vectors(rowid,embedding) VALUES(?,?)",
+                                   [.int(rowID), .floats(record.center)])
+                    try db.execute("""
+                        INSERT OR REPLACE INTO doc_residuals(doc_id,token_count,dim,quant_bits,scale,offset,residual_blob)
+                        VALUES(?,?,?,?,?,?,?)
+                        """, [.text(id), .int(Int64(record.tokenCount)), .int(Int64(record.dim)), .int(Int64(record.bits)),
+                              .double(Double(record.scale)), .double(Double(record.offset)), .blob(record.blob)])
+                }
+                report.filled += 1
+            } catch {
+                report.failed = error.localizedDescription
+                report.skipped += 1
+            }
+            progress?(report.filled + report.skipped, rows.count)
+        }
+        return report
+    }
+
+    private func writeEmptyResidual(docID: String) throws {
+        try db.transaction {
+            try db.execute("""
+                INSERT OR REPLACE INTO doc_residuals(doc_id,token_count,dim,quant_bits,scale,offset,residual_blob)
+                VALUES(?,?,?,?,?,?,?)
+                """, [.text(docID), .int(0), .int(Int64(ColBERT.dimension)), .int(4),
+                      .double(1), .double(0), .blob(Data())])
+        }
+    }
+
+    /// 待回填的切片数（GUI 显示后台进度）。
+    func pendingVectorCount() -> Int {
+        guard let rows = try? db.query("""
+            SELECT COUNT(*) AS n FROM document AS d
+            LEFT JOIN doc_residuals AS r ON r.doc_id = d.doc_id WHERE r.doc_id IS NULL
+            """), let n = rows.first?["n"]?.intValue else { return 0 }
+        return Int(n)
     }
 
     // MARK: - 检索
@@ -474,7 +600,7 @@ final class SearchEngine {
         return data.withUnsafeBytes { Array($0.bindMemory(to: Float16.self)) }
     }
 
-    private func hash8(_ text: String) -> String {
+    private static func hash8(_ text: String) -> String {
         var hash: UInt64 = 0xcbf29ce484222325
         for byte in text.utf8 {
             hash ^= UInt64(byte)

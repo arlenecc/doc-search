@@ -48,12 +48,13 @@ final class KnowledgeSyncService {
             at: URL(fileURLWithPath: (database as NSString).deletingLastPathComponent),
             withIntermediateDirectories: true)
 
-        await progress(SyncProgressInfo(phase: "加载模型与数据库", message: config.modelDirectory))
-        let colbert = try await ColBERT.load(modelDir: config.modelDirectory,
-                                              threads: max(1, config.syncConcurrency))
+        // Markdown 生成后直接切文本入库，不加载 ColBERT。词向量由后台回填服务异步补算；
+        // 关闭向量检索模式时则完全不计算词向量，节省空间。
         let db = try SQLiteDB(path: database)
         try SearchEngine.createSchema(db)
-        let engine = SearchEngine(db: db, colbert: colbert, options: config.chunkOptions)
+        await progress(SyncProgressInfo(
+            phase: "准备数据库",
+            message: config.useVectorSearch ? "文本切片入库（词向量后台填充）" : "纯文本入库（向量检索未启用）"))
 
         let request = MarkdownConversionRequest(sourceURL: source, outputDirectory: output,
                                                 config: config.parserConfig,
@@ -87,7 +88,7 @@ final class KnowledgeSyncService {
                 completed: index + 1,
                 total: successes.count,
                 fileName: item.source.lastPathComponent,
-                message: "词向量与 4bit 残差",
+                message: config.useVectorSearch ? "文本切片（词向量后台填充）" : "文本切片",
                 fraction: Double(index + 1) / Double(max(1, successes.count))))
             do {
                 let title = (item.source.lastPathComponent as NSString).deletingPathExtension
@@ -105,14 +106,15 @@ final class KnowledgeSyncService {
                         completed: done,
                         total: total,
                         fileName: fileName,
-                        message: "词向量与 4bit 残差 \(done)/\(total)",
+                        message: "文本切片 \(done)/\(total)",
                         fraction: fileBase + inner * fileSpan)
                     Task { @MainActor in progress(info) }
                 }
-                result.chunks += try engine.addFile(path: url.path, title: title,
-                                                    bits: config.quantBits,
-                                                    progress: ingestProgress,
-                                                    cancelled: { [weak self] in self?.isCancelled ?? false })
+                // 同步阶段只写文本切片；词向量由 AppModel/CLI 在同步完成后后台回填。
+                result.chunks += try SearchEngine.addFileTextOnly(
+                    db: db, options: config.chunkOptions, path: url.path, title: title,
+                    progress: ingestProgress,
+                    cancelled: { [weak self] in self?.isCancelled ?? false })
             } catch is CancellationError {
                 throw CancellationError()
             } catch {

@@ -5,7 +5,7 @@ enum DocSearchCLI {
     static let defaultModel = "/Volumes/SSD/embedding&reranker/jina-colbert-v2-64-onnx-int8"
 
     static let commands: Set<String> = [
-        "init", "add", "sync", "search", "decision-search", "decision-verify", "self-test", "db-stats", "ann-status",
+        "init", "add", "sync", "search", "decision-search", "decision-verify", "sentence-test", "vector-fill", "self-test", "db-stats", "ann-status",
         "ann-build", "ann-drop", "ann-bench", "ocr-test", "chunk-test", "models",
         "-h", "--help", "help",
     ]
@@ -41,9 +41,19 @@ enum DocSearchCLI {
             guard let path = options["file"] else { throw DocSearchError.argument("add 需要 --file PATH") }
             let db = try SQLiteDB(path: dbPath)
             try SearchEngine.createSchema(db)
+            var cfg = config
+            if options["text-only"] != nil {
+                // 纯文本入库：不加载 ColBERT，切片直接写 document/FTS，供决策判定即时用。
+                let count = try SearchEngine.addFileTextOnly(
+                    db: db, options: cfg.chunkOptions, path: path, title: options["title"],
+                    progress: { done, total in
+                        if done % 10 == 0 || done == total { print("  切片 \(done)/\(total) 已入库") }
+                    })
+                print("纯文本入库完成: \(path)，共 \(count) 个切片（词向量未计算）")
+                return
+            }
             let colbert = try await ColBERT.load(modelDir: modelDir,
                                                   threads: Int(options["threads"] ?? "") ?? 4)
-            var cfg = config
             if let value = options["bits"] { cfg.quantBits = Int(value) ?? cfg.quantBits }
             let bits = cfg.quantBits
             var timings: [String: Double] = [:]
@@ -97,7 +107,8 @@ enum DocSearchCLI {
             let judge = try await DecisionJudge.load(
                 modelPath: decisionPath,
                 batchSize: batchSize,
-                chunkChars: Int(options["chunk-chars"] ?? "") ?? config.decisionChunkChars)
+                chunkChars: Int(options["chunk-chars"] ?? "") ?? config.decisionChunkChars,
+                coreSentenceCount: Int(options["core"] ?? "") ?? config.decisionCoreSentences)
             let loadElapsed = Date().timeIntervalSince(loadStart)
             let judgeStart = Date()
             let verdicts = try await judge.judge(query: query, slices: slices, topN: topN) { done, total in
@@ -114,6 +125,32 @@ enum DocSearchCLI {
                 print("    doc_id=\(slice.docID)  title=\(slice.title)")
                 let preview = slice.content.prefix(options["full"] != nil ? slice.content.count : 220)
                 print("    \(preview)")
+            }
+        case "vector-fill":
+            // 单独运行后台词向量回填（同步未完成或中断后用）。
+            var cfg = ToolConfig.load()
+            if let value = options["model"] { cfg.modelDirectory = value }
+            if let value = options["bits"] { cfg.quantBits = Int(value) ?? cfg.quantBits }
+            if let value = options["threads"] { cfg.vectorBackfillThreads = Int(value) ?? cfg.vectorBackfillThreads }
+            print("回填数据库: \(dbPath)")
+            let filled = try await VectorBackfill.run(config: cfg, dbPathOverride: dbPath, cancelled: { false }) { done, total in
+                if done == total || done % 20 == 0 { print("  词向量回填 \(done)/\(total)") }
+            }
+            print("词向量回填完成：\(filled) 片")
+        case "sentence-test":
+            guard let query = options["query"], let file = options["file"] else {
+                throw DocSearchError.argument("sentence-test 需要 --query TEXT --file PATH")
+            }
+            guard let text = FileManager.default.contents(atPath: file).flatMap({ String(data: $0, encoding: .utf8) }) else {
+                throw DocSearchError.argument("无法读取 UTF-8 文件: \(file)")
+            }
+            let core = SentenceBM25.coreSentences(query: query, content: text,
+                                                  maxSentences: Int(options["max"] ?? "") ?? 5,
+                                                  maxSentenceChars: Int(options["chars"] ?? "") ?? config.decisionChunkChars)
+            print("query: \(query)")
+            print("核心句（按原文顺序）:")
+            for (i, line) in core.split(separator: "\n").enumerated() {
+                print("  [\(i + 1)] \(line)")
             }
         case "decision-verify":
             // 读取 Python 参考实现保存的 token ids / marker / 概率，对比 Swift backbone 输出。
@@ -183,6 +220,7 @@ enum DocSearchCLI {
             if let value = options["model"] { cfg.modelDirectory = value }
             if let value = options["bits"] { cfg.quantBits = Int(value) ?? 4 }
             if let value = options["threads"] { cfg.syncConcurrency = Int(value) ?? 3 }
+            if options["no-vector"] != nil { cfg.useVectorSearch = false }
             guard !cfg.sourceDirectory.isEmpty else {
                 throw DocSearchError.argument("sync 需要 --source 目录或在配置面板指定源目录")
             }
@@ -195,6 +233,17 @@ enum DocSearchCLI {
             }
             print("同步完成：文件 \(report.succeeded)/\(report.files)，跳过 \(report.skipped)，"
                   + "失败 \(report.failed)，切片 \(report.chunks)，耗时 \(String(format: "%.2f", report.elapsed))s")
+            if cfg.useVectorSearch {
+                print("文本切片已可用于决策判定；开始后台回填词向量…")
+                let filled = try await VectorBackfill.run(config: cfg, cancelled: { false }) { done, total in
+                    if done == total || done % 20 == 0 {
+                        print("  词向量回填 \(done)/\(total)")
+                    }
+                }
+                print("词向量回填完成：\(filled) 片")
+            } else {
+                print("向量检索已关闭：未计算词向量，仅保留文本切片供决策判定。")
+            }
         case "db-stats":
             try dbStats(dbPath)
         case "ann-status":
@@ -745,12 +794,18 @@ enum DocSearchCLI {
     private static let usage = """
     doc_search — ColBERT 问句直接检索长文档（独立 Swift 工具）
 
-      swift run -c release DocSearch sync  --source 源目录 [--workdir 工作目录] [--bits 4] [--threads 3]
+      swift run -c release DocSearch sync  --source 源目录 [--workdir 工作目录] [--bits 4] [--threads 3] [--no-vector]
+        # 同步先入库文本切片（决策判定立即可用），词向量随后后台回填；--no-vector 完全跳过词向量省空间
       swift run -c release DocSearch init  --db PATH
-      swift run -c release DocSearch add   --db PATH --file 文本_path [--title 标题] [--bits 4] [--model DIR] [--timing]
+      swift run -c release DocSearch add   --db PATH --file 文本_path [--title 标题] [--bits 4] [--model DIR] [--timing] [--text-only]
       swift run -c release DocSearch search --db PATH --query "问句" [--top 5] [--coarse 20] [--nprobe 32] [--rescore 64] [--min-score-ratio 0.9] [--exact] [--force-ann]
       swift run -c release DocSearch decision-search --db PATH --query "问句" [--top 5] [--recall 50] [--batch 8] [--chunk-chars 160] [--model DIR] [--full]
-        # 决策判定路径：BM25 从原文切片表召回 → karpo 决策模型逐片判定相关性 → 取分数最高 topN
+        # 决策判定路径：BM25 从原文切片表召回 → 字符级 BM25 提核心句 → karpo 决策模型判定 → 取分数最高 topN
+      swift run -c release DocSearch vector-fill [--db PATH] [--model DIR] [--bits 4] [--threads 2]
+        # 单独运行后台词向量回填（同步中断或 App 重启后补算）
+      swift run -c release DocSearch sentence-test --query "问句" --file 切片文本 [--max 5] [--chars 160]
+        # 查看字符级 BM25 从切片里挑出的核心句（按原文顺序）
+      swift run -c release DocSearch decision-verify --probe /path/to/probe.json
       swift run -c release DocSearch db-stats --db PATH
       swift run -c release DocSearch ann-status --db PATH
       swift run -c release DocSearch ann-build  --db PATH [--clusters 512] [--cluster-size 512] [--iterations 8] [--force]

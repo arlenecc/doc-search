@@ -9,6 +9,14 @@ struct ChatBubbleItem: Identifiable {
     var hits: [SearchHit]? = nil
 }
 
+/// 后台回填取消标志（跨 actor 共享，内部加锁）。
+final class BackfillCancelFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    func get() -> Bool { lock.lock(); defer { lock.unlock() }; return value }
+    func set(_ v: Bool) { lock.lock(); value = v; lock.unlock() }
+}
+
 struct ReaderState: Identifiable {
     let id = UUID()
     let messageID: UUID
@@ -30,6 +38,10 @@ final class AppModel: ObservableObject {
     @Published var isSearching = false
     @Published var syncStatus = "尚未同步"
     @Published var syncFraction = 0.0
+    /// 后台词向量回填进度（向量检索启用时，同步完成后异步进行）。
+    @Published var isBackfilling = false
+    @Published var backfillDone = 0
+    @Published var backfillTotal = 0
     @Published var lastReport: SyncReport?
     @Published var reader: ReaderState?
     @Published var status = ""
@@ -42,6 +54,8 @@ final class AppModel: ObservableObject {
 
     private var engine: SearchEngine?
     private var decisionJudge: DecisionJudge?
+    private var backfillTask: Task<Void, Never>?
+    private var backfillFlag: BackfillCancelFlag?
     private let syncService = KnowledgeSyncService()
     private let modelDownloader = DocSearchModelDownloader()
 
@@ -108,7 +122,7 @@ final class AppModel: ObservableObject {
         config.searchMode = mode
         config.save()
         status = mode == "decision"
-            ? "决策判定：BM25 召回 + 决策模型判定（首次会加载 4B 模型）"
+            ? "决策判定：BM25 召回 + 决策模型判定（首次会加载模型）"
             : "向量检索：ColBERT + MaxSim"
     }
 
@@ -129,7 +143,8 @@ final class AppModel: ObservableObject {
             let judge = try await Task.detached(priority: .userInitiated) {
                 try await DecisionJudge.load(modelPath: cfg.decisionModelPath,
                                              batchSize: cfg.decisionBatchSize,
-                                             chunkChars: cfg.decisionChunkChars)
+                                             chunkChars: cfg.decisionChunkChars,
+                                             coreSentenceCount: cfg.decisionCoreSentences)
             }.value
             decisionJudge = judge
         }
@@ -165,8 +180,13 @@ final class AppModel: ObservableObject {
         do {
             let q = query
             let hits: [SearchHit]
-            if searchMode == "decision" {
-                status = "决策判定：初始化模型…"
+            if searchMode == "decision" || !config.useVectorSearch {
+                // 关闭向量检索时，即使开关在向量模式也自动走决策判定，保证可用。
+                if !config.useVectorSearch && searchMode != "decision" {
+                    messages.append(ChatBubbleItem(role: .assistant,
+                        text: "向量检索已在配置中关闭，已自动改用决策判定模式。"))
+                }
+                status = decisionJudge == nil ? "决策判定：首次加载模型…" : "决策判定中…"
                 hits = try await decisionSearch(query: q)
             } else {
                 try await ensureEngine()
@@ -187,7 +207,7 @@ final class AppModel: ObservableObject {
             messages.append(ChatBubbleItem(
                 role: .assistant,
                 text: hits.isEmpty ? "没有召回相关分片。"
-                    : searchMode == "decision"
+                    : (searchMode == "decision" || !config.useVectorSearch)
                         ? "决策判定召回 \(hits.count) 个相关分片（按判定分数排序），点击气泡阅读："
                         : "召回 \(hits.count) 个分片，点击气泡阅读：",
                 hits: hits))
@@ -226,6 +246,8 @@ final class AppModel: ObservableObject {
             status = report.message
             AppLog.shared.log("[同步] 完成：文件 \(report.succeeded)/\(report.files)，切片 \(report.chunks)，跳过 \(report.skipped)")
             engine = nil
+            // 文本切片已可立即用于决策判定；词向量在后台异步填充。
+            startVectorBackfillIfNeeded()
         } catch is CancellationError {
             syncStatus = "同步已停止"
             status = "同步已停止"
@@ -238,6 +260,53 @@ final class AppModel: ObservableObject {
     }
 
     func stopSync() { syncService.cancel() }
+
+    /// 同步完成后启动后台词向量回填；关闭向量检索模式则不启动。
+    func startVectorBackfillIfNeeded() {
+        guard config.useVectorSearch else { return }
+        backfillTask?.cancel()
+        let cfg = config
+        // 用本地可变标志供后台读取，避免跨 actor 访问。
+        let flag = BackfillCancelFlag()
+        backfillFlag = flag
+        let task = Task.detached(priority: .utility) { [weak self] in
+            do {
+                let total = try await VectorBackfill.run(config: cfg, cancelled: { flag.get() }) { done, all in
+                    Task { @MainActor in
+                        self?.isBackfilling = true
+                        self?.backfillDone = done
+                        self?.backfillTotal = all
+                    }
+                }
+                await MainActor.run {
+                    self?.isBackfilling = false
+                    self?.backfillDone = total
+                    self?.backfillTotal = total
+                    // 回填完成后丢弃缓存引擎，后续向量检索重建以读取新向量。
+                    self?.engine = nil
+                }
+            } catch is CancellationError {
+                await MainActor.run { self?.isBackfilling = false }
+            } catch {
+                await MainActor.run {
+                    self?.isBackfilling = false
+                    AppLog.shared.log("[回填] 失败：\(error.localizedDescription)")
+                }
+            }
+        }
+        backfillTask = task
+        Task { @MainActor in
+            self.isBackfilling = true
+            self.backfillDone = 0
+        }
+    }
+
+    func stopVectorBackfill() {
+        backfillFlag?.set(true)
+        backfillTask?.cancel()
+        isBackfilling = false
+        AppLog.shared.log("[回填] 已停止")
+    }
 
     func openReader(messageID: UUID, index: Int) {
         guard let message = messages.first(where: { $0.id == messageID }),

@@ -9,6 +9,7 @@ struct RootView: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.openWindow) private var openWindow
     @State private var showSettings = false
+    @State private var mainWidth: CGFloat = 900
 
     var body: some View {
         NavigationSplitView {
@@ -45,6 +46,23 @@ struct RootView: View {
                         Text("文件 \(report.succeeded)/\(report.files) · 切片 \(report.chunks) · 跳过 \(report.skipped)")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
+                    }
+                    if model.config.useVectorSearch {
+                        if model.isBackfilling || model.backfillTotal > 0 {
+                            HStack {
+                                Text("词向量后台填充 \(model.backfillDone)/\(max(1, model.backfillTotal))")
+                                    .font(.caption2)
+                                Spacer()
+                                Button("停止") { model.stopVectorBackfill() }
+                                    .font(.caption2)
+                                    .disabled(!model.isBackfilling)
+                            }
+                            ProgressView(value: model.backfillTotal > 0
+                                ? Double(model.backfillDone) / Double(model.backfillTotal) : 0)
+                        }
+                    } else {
+                        Text("向量检索未启用（仅文本切片，决策判定可直接用）")
+                            .font(.caption2).foregroundStyle(.secondary)
                     }
                 }
                 Section("模型") {
@@ -99,10 +117,17 @@ struct RootView: View {
             }
             .frame(minWidth: 680, minHeight: 620)
         }
+        .background(
+            GeometryReader { geo in
+                Color.clear
+                    .onAppear { mainWidth = geo.size.width }
+                    .onChange(of: geo.size.width) { _, new in mainWidth = new }
+            }
+        )
         .sheet(item: $model.reader) { state in
             ChunkReaderView(state: state)
                 .environmentObject(model)
-                .frame(minWidth: 380, idealWidth: 420, minHeight: 560)
+                .frame(width: max(560, mainWidth * 0.8), height: 620)
         }
         .onReceive(NotificationCenter.default.publisher(for: .docSearchOpenSettings)) { _ in
             showSettings = true

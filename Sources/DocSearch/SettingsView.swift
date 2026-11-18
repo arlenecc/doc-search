@@ -16,6 +16,7 @@ struct SettingsView: View {
         VStack(spacing: 0) {
             Form {
                 Section("知识同步") {
+                    Toggle("启用向量检索（关闭则只入库文本切片，省空间）", isOn: $draft.useVectorSearch)
                     pathField("源目录", text: $draft.sourceDirectory, chooseDirectory: true)
                     pathField("工作目录", text: $draft.workDirectory, chooseDirectory: true)
                     Text("Markdown：\(draft.outputDirectory)\n数据库：\(draft.databasePath)")
@@ -23,6 +24,12 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                     pathField("ColBERT 模型目录", text: $draft.modelDirectory, chooseDirectory: true)
+                    if draft.useVectorSearch {
+                        Stepper("词向量回填线程 \(draft.vectorBackfillThreads)",
+                                value: $draft.vectorBackfillThreads, in: 1...8)
+                        Text("同步先入库文本切片，词向量后台异步填充；填充完成前向量检索结果不完整，可直接用决策判定模式。")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
                     Toggle("增量转换（源文件未变化时跳过）", isOn: $draft.incrementalConversion)
                     Stepper("并发数 \(draft.syncConcurrency)", value: $draft.syncConcurrency, in: 1...8)
                 }
@@ -90,9 +97,11 @@ struct SettingsView: View {
                                 value: $draft.decisionRecallCount, in: 10...1000, step: 10)
                         Stepper("判定批大小 \(draft.decisionBatchSize)",
                                 value: $draft.decisionBatchSize, in: 1...32, step: 1)
-                        Stepper("每片最大字数 \(draft.decisionChunkChars)",
+                        Stepper("核心句每句最大字数 \(draft.decisionChunkChars)",
                                 value: $draft.decisionChunkChars, in: 80...1200, step: 40)
-                        Text("决策模型为 karpo-decision-4B-mlx-int4（需含 readout.safetensors）。批大小越大越快但占用更多内存；每片字数越大越准确但更慢。")
+                        Stepper("核心句数量 \(draft.decisionCoreSentences)",
+                                value: $draft.decisionCoreSentences, in: 1...10, step: 1)
+                        Text("决策模型默认 karpo-decision-0.8B-mlx-int4（需含 readout.safetensors）。切片先经字符级 BM25 提取核心句再判定；句数/字数越大越准确但更慢，批大小越大越快但占用更多内存。")
                             .font(.caption2).foregroundStyle(.secondary)
                     }
                     DisclosureGroup("检索 / 阅读") {

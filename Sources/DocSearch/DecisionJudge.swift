@@ -34,21 +34,25 @@ final class DecisionJudge {
 
     /// 单批最多放入的切片数。M1 上 prefill ~8ms/token，控制单序列长度避免 OOM/卡顿。
     private let batchSize: Int
-    /// 单个切片送入判定时的最大字符数（BM25 命中片段通常在开头，截断保速度）。
+    /// 单个切片送入判定时核心句的每句最大字符数。
     private let chunkChars: Int
+    /// 每个切片提取的核心句数量。
+    private let coreSentenceCount: Int
 
     private init(container: ModelContainer, tokenizer: any MLXLMCommon.Tokenizer,
                  readoutWeight: MLXArray, markerID: Int,
-                 batchSize: Int, chunkChars: Int) {
+                 batchSize: Int, chunkChars: Int, coreSentenceCount: Int) {
         self.container = container
         self.tokenizer = tokenizer
         self.readoutWeight = readoutWeight
         self.markerID = markerID
         self.batchSize = max(1, batchSize)
         self.chunkChars = max(80, chunkChars)
+        self.coreSentenceCount = max(1, coreSentenceCount)
     }
 
-    static func load(modelPath: String, batchSize: Int = 8, chunkChars: Int = 160) async throws -> DecisionJudge {
+    static func load(modelPath: String, batchSize: Int = 8, chunkChars: Int = 160,
+                     coreSentenceCount: Int = 3) async throws -> DecisionJudge {
         let directory = URL(fileURLWithPath: (modelPath as NSString).expandingTildeInPath,
                             isDirectory: true)
         guard FileManager.default.fileExists(atPath: directory.appendingPathComponent("readout.safetensors").path) else {
@@ -69,7 +73,8 @@ final class DecisionJudge {
         AppLog.shared.log("[决策] 模型加载完成（readout \(weight.shape.map(String.init).joined(separator: "×"))）")
         return DecisionJudge(container: container, tokenizer: loadedTokenizer,
                              readoutWeight: weight, markerID: mid,
-                             batchSize: batchSize, chunkChars: chunkChars)
+                             batchSize: batchSize, chunkChars: chunkChars,
+                             coreSentenceCount: coreSentenceCount)
     }
 
     /// 对 BM25 召回的切片批量判定相关性，返回分数最高的 topN 个。
@@ -163,7 +168,7 @@ final class DecisionJudge {
 
         var parts: [String] = ["State:\nQuery: \(escape(query))"]
         for (index, slice) in chunks.enumerated() {
-            let text = condensed(slice)
+            let text = condensed(slice, query: query)
             parts.append("Question \(index + 1):\nDocument chunk: \(escape(text))\n" +
                          "\(Self.relevanceQuestion)\nOptions:\nA: No / false\nB: Yes / true\n\(Self.markerToken)")
         }
@@ -176,13 +181,16 @@ final class DecisionJudge {
         return try tokenizer.applyChatTemplate(messages: messages, tools: nil, additionalContext: nil)
     }
 
-    /// 判定只关心相关性，取标题 + 正文前 chunkChars 字，避免长序列拖慢 M1。
-    private func condensed(_ slice: BM25Slice) -> String {
+    /// 判定只关心相关性：用字符级 BM25 从切片里挑出与 query 最相关的 5 句
+    /// （按原文顺序），拼成核心片段代替整片，避免长序列拖慢 M1。
+    private func condensed(_ slice: BM25Slice, query: String) -> String {
         let title = slice.title.trimmingCharacters(in: .whitespacesAndNewlines)
         let body = slice.content.trimmingCharacters(in: .whitespacesAndNewlines)
-        let prefix = String(body.prefix(chunkChars))
-        if title.isEmpty { return prefix }
-        return "\(title)\n\(prefix)"
+        let core = SentenceBM25.coreSentences(query: query, content: body,
+                                              maxSentences: coreSentenceCount,
+                                              maxSentenceChars: chunkChars)
+        if title.isEmpty { return core }
+        return "\(title)\n\(core)"
     }
 
     /// 与 karpo Encoder.escape 一致：把特殊 token 的尖括号替换为全角，

@@ -15,7 +15,7 @@ struct RootView: View {
         NavigationSplitView {
             List {
                 Section("工作区") {
-                    Label("检索对话", systemImage: "bubble.left.and.bubble.right")
+                    Label("对话检索", systemImage: "bubble.left.and.bubble.right")
                         .foregroundColor(.accentColor)
                     Picker("检索方式", selection: Binding(
                         get: { model.searchMode },

@@ -646,7 +646,49 @@ enum DocSearchCLI {
         try vdsPCheck()
         try chunkCheck()
         try sqliteCheck()
+        try simHashCheck()
         print(withModel ? "（带模型端到端测试将在建库后执行）" : "全部离线测试通过（加 --model PATH 可跑端到端）")
+    }
+
+    private static func simHashCheck() throws {
+        // MurmurHash3 x64_128 (h1) 权威向量（与 tools/SimHashDedupe 自检一致）。
+        let vectors: [(String, String)] = [
+            ("", "0000000000000000"),
+            ("foo", "e271865701f54561"),
+            ("hello", "cbd8a7b341bd9b02"),
+            ("量子力学", "dc380f4d0ae2fc34"),
+            ("abcdefghijklmnopq", "7564747f88bda657"),
+        ]
+        for (s, expected) in vectors {
+            let raw = String(SimHashStore.hash64(s), radix: 16)
+            let actual = String(repeating: "0", count: max(0, 16 - raw.count)) + raw
+            guard actual == expected else {
+                throw DocSearchError.quant("MurmurHash 向量不符: \(s) \(actual) != \(expected)")
+            }
+        }
+        // SQLite 索引：相同文本判重复，不同文本不判重复。
+        let tmp = NSTemporaryDirectory() + "/simhash-check-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let db = try SQLiteDB(path: tmp)
+        try SimHashStore.createSchema(db)
+        let body = String(repeating: "量子力学与机器学习文本内容", count: 40)
+        let dir = (tmp as NSString).deletingLastPathComponent
+        let a = dir + "/simhash-a.md"
+        let b = dir + "/simhash-b.md"
+        let c = dir + "/simhash-c.md"
+        try body.write(toFile: a, atomically: true, encoding: .utf8)
+        try body.write(toFile: b, atomically: true, encoding: .utf8)
+        try String(repeating: "完全不同的另一段内容描述", count: 40)
+            .write(toFile: c, atomically: true, encoding: .utf8)
+        try SimHashStore.insert(text: body, path: a, into: db)
+        guard let dup = try SimHashStore.findDuplicate(text: body, path: b, in: db), dup.hamming == 0 else {
+            throw DocSearchError.quant("SimHash 重复判定失败")
+        }
+        guard try SimHashStore.findDuplicate(text: String(repeating: "完全不同的另一段内容描述", count: 40),
+                                              path: c, in: db) == nil else {
+            throw DocSearchError.quant("SimHash 误判不同文本为重复")
+        }
+        print("  SimHash 排重: Murmur 向量 5 项 + SQLite 索引重复/非重复判定通过")
     }
 
     private static func quantRoundTrip(bits: Int) throws {

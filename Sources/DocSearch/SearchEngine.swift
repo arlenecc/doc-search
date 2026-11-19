@@ -34,6 +34,9 @@ final class SearchEngine {
     let colbert: ColBERT
     let options: ChunkOptions
     private let rrfK = 60.0
+    /// 加权 RRF 权重：向量 70% / BM25 30%（向量+BM25 混合召回融合）。
+    private let rrfVectorWeight = 0.7
+    private let rrfBM25Weight = 0.3
     /// AND 命中少于该数量时换用 OR，避免中文长 query 只剩一两条候选。
     private let minBM25Hits = 5
     /// 最近一次检索的向量通道（ann / vec0-exact），供 CLI 输出。
@@ -455,7 +458,7 @@ final class SearchEngine {
             var c = candidates[pair.id] ?? Candidate(docID: pair.id)
             c.vectorRank = rank + 1
             c.vectorDistance = pair.distance
-            c.rrf += 1.0 / (rrfK + Double(rank + 1))
+            c.rrf += rrfVectorWeight / (rrfK + Double(rank + 1))
             candidates[pair.id] = c
         }
 
@@ -479,7 +482,7 @@ final class SearchEngine {
             var c = candidates[id] ?? Candidate(docID: id)
             c.bm25Rank = rank + 1
             c.bm25Score = row["score"]?.doubleValue ?? nil
-            c.rrf += 1.0 / (rrfK + Double(rank + 1))
+            c.rrf += rrfBM25Weight / (rrfK + Double(rank + 1))
             candidates[id] = c
         }
 

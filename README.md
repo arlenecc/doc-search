@@ -9,6 +9,7 @@ macOS 上的本地文档检索与阅读工具：把 PDF / EPUB / Office / 纯文
 - **多格式解析**：PDF（Apple Vision / OvisOCR3 / 混合）、EPUB、Office、纯文本；支持增量转换与取消。
 - **语义切片**：优先按章节目录层级分节，小节尽量保持完整；结合 potion multilingual 句向量判断语义断点；默认切片 2500–3000 字、1.5% 重叠，表格与代码块保持完整。
 - **ColBERT 编码**：查询与文档分别使用 `[QueryMarker]`(250002) / `[DocumentMarker]`(250003)；查询侧按 ColBERT 约定补 `<mask>` 增强；文档侧做词项剪枝后逐词编码并 L2 归一化。
+- **全局文本排重**：Markdown 生成后、切片入库前，用移植自 `tools/SimHashDedupe` 的 SimHash(64) + 4 表 LSH + 内容复核（3-gram Jaccard）对全文判重；与已入库文档高度相似的直接跳过，不再重复切片入库。指纹索引用 SQLite 持久化（首次启用时用已有 Markdown 初始化），跨次同步全局有效。
 - **异步入库 + 双检索路径**：同步时 Markdown 生成后立即切文本切片入库，**决策判定随即可用**；ColBERT 词向量/4bit 残差由后台异步读取切片计算填充，填完后向量检索才完全生效（GUI 侧栏显示回填进度，可停止）。配置可关闭向量检索模式——关闭后完全不计算词向量、不占向量空间，只保留文本切片供决策判定。
 - **双检索路径**：主窗口左上角“工作区”提供二选一开关——**向量检索**（默认：ColBERT + BM25 混合召回 + 4bit 残差 MaxSim 精排）与**决策判定**（BM25 从原文切片表召回前 50 条 → 决策模型逐片判定相关性 → 取分数最高的 5 条）。关闭向量检索模式时自动走决策判定。
 - **决策判定**：默认使用 `karpo-decision-0.8B-mlx-int4`（也可在设置里换成 4B）。每个召回切片先用**字符级 BM25**（字符 3-gram 滑动窗口、k1=1.6、b=0.4）在切片内逐句打分，取分数最高的 3 句按原文顺序拼成核心片段；再在 joint-preview 模板下为核心片段放 readout marker，读取 backbone final-norm hidden state 经 fp32 readout 头算出 P(相关)；一次前向批量判定多个切片。可配置召回数（默认 50）、批大小（默认 8）、每句最大字数（默认 160）与核心句数量（默认 3）。
@@ -21,12 +22,14 @@ macOS 上的本地文档检索与阅读工具：把 PDF / EPUB / Office / 纯文
 ```
 问句 → 轻量剪枝(标点/空白/停用词) → [QueryMarker] + <mask> 增强 → ColBERT ONNX 编码
      → query 中心向量(vec0/ANN 粗排) ┐
-     → BM25 倒排召回                 ├→ RRF → shortlist → 4bit 残差 MaxSim 重排
+     → BM25 倒排召回                 ├→ 加权 RRF(向量 70% / BM25 30%) → shortlist → 4bit 残差 MaxSim 重排
 文档 → 解析/Markdown → 语义切片 → 词项剪枝 → ColBERT 词向量 → L2 归一化 → 4bit 残差量化
                                                                   → 最低分比例 → TopN
 ```
 
-索引表：`document` / `document_fts`(BM25) / `doc_summary_vec`(vec0 cosine) / `doc_vectors` / `doc_residuals` / `ann_blocks` / `ann_cells`。
+混合召回的融合采用**加权 RRF**：向量通道权重 70%、BM25 通道 30%（`rrf = w / (60 + rank)`），加权分数只用于粗筛 shortlist，最终顺序仍由 4bit 残差 MaxSim 精排决定。
+
+索引表：`document` / `document_fts`(BM25) / `doc_summary_vec`(vec0 cosine) / `doc_vectors` / `doc_residuals` / `ann_blocks` / `ann_cells` / `simhash_docs` + `simhash_bands`(全文排重)。
 
 ## 环境要求
 

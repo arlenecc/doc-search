@@ -42,11 +42,13 @@ macOS 上的本地文档检索与阅读工具：把 PDF / EPUB / Office / 纯文
 ## 构建与运行
 
 ```bash
-./build.sh          # swift build -c release
-./build-app.sh      # 生成 dist/DocSearch.app 与 dist/DocSearch.dmg
+./build.sh          # release 构建：-Osize + Strip Debug Symbols(-gnone) + LTO(llvm-thin) + 跨模块优化 + strip 产物
+./build-app.sh      # 生成 dist/DocSearch.app 与 dist/DocSearch.dmg（打包时再 strip 一次可执行文件）
 
 swift run -c release DocSearch          # 启动 GUI
 ```
+
+`build.sh` 的体积优化使可执行文件从约 85MB 降到约 44MB，DMG 约 27MB；优化参数说明见脚本内注释。
 
 CLI 支持 `--key` 与 `--key=value` 两种参数形式。每次检索返回前都会自动打印整体耗时及各阶段耗时，无需额外参数。
 

@@ -17,8 +17,9 @@ rm -rf "$APP" dist/DocSearch.dmg
 echo "==> 创建 .app 结构"
 mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Frameworks" "$CONTENTS/Resources"
 
-echo "==> 拷贝可执行文件"
+echo "==> 拷贝可执行文件（strip 调试符号）"
 cp "$BIN" "$CONTENTS/MacOS/DocSearch"
+strip -S "$CONTENTS/MacOS/DocSearch" 2>/dev/null || true
 
 echo "==> 拷贝动态库 framework"
 cp -a .build/release/llama.framework "$CONTENTS/Frameworks/"
